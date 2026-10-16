@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Blossom server</title>
+<style>
+  :root { color-scheme: light dark; font-family: system-ui, sans-serif; }
+  body { max-width: 40rem; margin: 4rem auto; padding: 0 1.25rem; line-height: 1.55; }
+  h1 { font-size: 1.6rem; margin-bottom: .25rem; }
+  .sub { opacity: .7; margin-top: 0; }
+  code { font-size: .92em; }
+  table { border-collapse: collapse; margin: 1rem 0; }
+  td { padding: .2rem 1rem .2rem 0; vertical-align: top; }
+  a { color: inherit; }
+</style>
+</head>
+<body>
+<h1>Blossom server</h1>
+<p class="sub">{{count}} blobs, served at <code>{{public_url}}</code></p>
+<p>This is a <a href="https://github.com/hzrd149/blossom">Blossom</a> server: it stores
+blobs addressed by their SHA-256 hash, for Nostr clients.</p>
+<table>
+  <tr><td><code>GET /&lt;sha256&gt;</code></td><td>Fetch a blob (BUD-01)</td></tr>
+  <tr><td><code>PUT /upload</code></td><td>Upload a blob, with a Nostr auth token (BUD-02)</td></tr>
+  <tr><td><code>PUT /mirror</code></td><td>Copy a blob from another server (BUD-04)</td></tr>
+  <tr><td><code>DELETE /&lt;sha256&gt;</code></td><td>Delete your blob (BUD-12)</td></tr>
+  <tr><td><code>PUT /report</code></td><td>Report a blob (BUD-09)</td></tr>
+</table>
+<p>Powered by ditto-blossom.</p>
+</body>
+</html>

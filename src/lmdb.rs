@@ -1,0 +1,819 @@
+//! A small, safe wrapper over the LMDB C API.
+//!
+//! heed has no way to seek within a key's sorted duplicates
+//! (`MDB_GET_BOTH_RANGE`) or to count them (`mdb_cursor_count`). The relay's
+//! indexes are built on exactly those: each is a `DUPSORT | DUPFIXED` table
+//! whose key is stored once and whose entries are packed fixed-size values,
+//! which is several times smaller than one key per entry.
+//!
+//! An [`Env`] may be several LMDB environments, each its own file, whose
+//! tables are used as one: a transaction spans them all, and each [`Db`]
+//! knows which it's in. Read transactions begin in the order the
+//! environments were opened, and write transactions commit in the reverse,
+//! so a reader sees everything the first environment's tables point to in
+//! the others, as long as writers put it there in the same transaction. A
+//! crash between the commits can leave the later environments with writes
+//! the first never committed: callers must cope with those.
+//!
+//! Taken from ditto-relay, without its checkpoints: an environment here is
+//! either [durable](Sync::Durable), each commit flushed before it returns,
+//! or [lazy](Sync::Lazy), flushed when the kernel likes and so disposable
+//! after a crash of the machine.
+//!
+//! All the `unsafe` in the crate lives here.
+
+use std::ffi::{CStr, CString};
+use std::marker::PhantomData;
+use std::path::Path;
+use std::ptr;
+
+use lmdb_master_sys as ffi;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Error(i32);
+
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // SAFETY: mdb_strerror returns a static, NUL-terminated string for any code.
+        let message = unsafe { CStr::from_ptr(ffi::mdb_strerror(self.0)) };
+        write!(f, "LMDB: {}", message.to_string_lossy())
+    }
+}
+
+impl std::error::Error for Error {}
+
+pub type Result<T> = std::result::Result<T, Error>;
+
+fn check(code: i32) -> Result<()> {
+    if code == ffi::MDB_SUCCESS {
+        Ok(())
+    } else {
+        Err(Error(code))
+    }
+}
+
+/// `Ok(None)` for `MDB_NOTFOUND`, so lookups read naturally.
+fn found(code: i32) -> Result<Option<()>> {
+    match code {
+        ffi::MDB_SUCCESS => Ok(Some(())),
+        ffi::MDB_NOTFOUND => Ok(None),
+        code => Err(Error(code)),
+    }
+}
+
+fn val(bytes: &[u8]) -> ffi::MDB_val {
+    ffi::MDB_val {
+        mv_size: bytes.len(),
+        mv_data: bytes.as_ptr() as *mut _,
+    }
+}
+
+fn empty() -> ffi::MDB_val {
+    ffi::MDB_val {
+        mv_size: 0,
+        mv_data: ptr::null_mut(),
+    }
+}
+
+/// The bytes a value points at.
+///
+/// # Safety
+/// `v` must have come from LMDB within a transaction that outlives `'t`.
+unsafe fn bytes<'t>(v: &ffi::MDB_val) -> &'t [u8] {
+    if v.mv_size == 0 {
+        &[]
+    } else {
+        // SAFETY: LMDB hands back pointers into the map valid for the transaction.
+        unsafe { std::slice::from_raw_parts(v.mv_data as *const u8, v.mv_size) }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DbFlags {
+    /// Keys may hold many values, kept sorted.
+    pub dup_sort: bool,
+    /// With `dup_sort`: every value is the same size, and stored packed.
+    pub dup_fixed: bool,
+    /// Keys are native-endian integers, compared as such.
+    pub integer_key: bool,
+}
+
+impl DbFlags {
+    pub const PLAIN: DbFlags = DbFlags {
+        dup_sort: false,
+        dup_fixed: false,
+        integer_key: false,
+    };
+    pub const DUP_FIXED: DbFlags = DbFlags {
+        dup_sort: true,
+        dup_fixed: true,
+        integer_key: false,
+    };
+    pub const INTEGER_KEY: DbFlags = DbFlags {
+        dup_sort: false,
+        dup_fixed: false,
+        integer_key: true,
+    };
+
+    fn bits(self) -> u32 {
+        let mut bits = 0;
+        if self.dup_sort {
+            bits |= ffi::MDB_DUPSORT;
+        }
+        if self.dup_fixed {
+            bits |= ffi::MDB_DUPFIXED;
+        }
+        if self.integer_key {
+            bits |= ffi::MDB_INTEGERKEY;
+        }
+        bits
+    }
+
+    /// The flags of a table LMDB says has `bits`, if it's one of the kinds
+    /// this module makes.
+    fn from_bits(bits: u32) -> Result<DbFlags> {
+        let flags = DbFlags {
+            dup_sort: bits & ffi::MDB_DUPSORT != 0,
+            dup_fixed: bits & ffi::MDB_DUPFIXED != 0,
+            integer_key: bits & ffi::MDB_INTEGERKEY != 0,
+        };
+        let known = ffi::MDB_DUPSORT | ffi::MDB_DUPFIXED | ffi::MDB_INTEGERKEY;
+        if bits & !known != 0 || flags.dup_sort != flags.dup_fixed {
+            return Err(Error(ffi::MDB_INCOMPATIBLE));
+        }
+        Ok(flags)
+    }
+}
+
+/// A table within one of an [`Env`]'s environments.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Db {
+    dbi: ffi::MDB_dbi,
+    env: usize,
+}
+
+/// The most environments an [`Env`] holds.
+const MAX_ENVS: usize = 2;
+
+/// See [`Env::usage`].
+pub struct Usage {
+    pub map: u64,
+    pub used: u64,
+}
+
+/// Whether an environment's commits are flushed to disk as they're made.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Sync {
+    /// Each commit is on disk before it returns. A crash of the machine
+    /// loses nothing committed.
+    Durable,
+    /// Commits are written when the kernel likes (`MDB_NOSYNC`). A crash of
+    /// the machine can leave the environment corrupt, so only for what can
+    /// be thrown away and rebuilt.
+    Lazy,
+}
+
+pub struct Env {
+    ptrs: Vec<*mut ffi::MDB_env>,
+    /// Opened only to read: no write transaction can begin, so the writer's
+    /// lock, which another process may hold, is never waited on.
+    read_only: bool,
+}
+
+// SAFETY: an MDB_env is safe to share between threads; transactions opened
+// from it carry their own restrictions, enforced by the types below.
+unsafe impl Send for Env {}
+unsafe impl std::marker::Sync for Env {}
+
+impl Env {
+    /// Open (creating if need be) the environment in the directory `path`.
+    pub fn open(path: &Path, sync: Sync, map_size: usize, max_dbs: u32, max_readers: u32) -> Result<Env> {
+        let mut env = Env::new(false);
+        env.add(path, map_size, sync_flags(sync), max_dbs, max_readers)?;
+        Ok(env)
+    }
+
+    /// Open the existing environment in the directory `path` only to read.
+    /// Its tables must exist already, and are opened without writing.
+    pub fn open_read_only(path: &Path, map_size: usize, max_dbs: u32, max_readers: u32) -> Result<Env> {
+        let mut env = Env::new(true);
+        env.add(path, map_size, ffi::MDB_RDONLY, max_dbs, max_readers)?;
+        Ok(env)
+    }
+
+    fn new(read_only: bool) -> Env {
+        Env {
+            ptrs: Vec::new(),
+            read_only,
+        }
+    }
+
+    /// Open (creating if need be) another environment, in the directory
+    /// `path`, whose tables share this one's transactions, returning which
+    /// it is for [`create_db_in`](Self::create_db_in).
+    pub fn attach(&mut self, path: &Path, sync: Sync, map_size: usize, max_dbs: u32, max_readers: u32) -> Result<usize> {
+        assert!(self.ptrs.len() < MAX_ENVS, "too many environments");
+        let flags = match self.read_only {
+            true => ffi::MDB_RDONLY,
+            false => sync_flags(sync),
+        };
+        self.add(path, map_size, flags, max_dbs, max_readers)?;
+        Ok(self.ptrs.len() - 1)
+    }
+
+    fn add(&mut self, path: &Path, map_size: usize, flags: u32, max_dbs: u32, max_readers: u32) -> Result<()> {
+        let path = CString::new(path.as_os_str().as_encoded_bytes()).map_err(|_| Error(libc::EINVAL))?;
+        let mut ptr = ptr::null_mut();
+        // SAFETY: plain FFI calls in the documented order; the env is closed
+        // by Drop if any fails, once it's in `ptrs`.
+        unsafe {
+            check(ffi::mdb_env_create(&mut ptr))?;
+            self.ptrs.push(ptr);
+            check(ffi::mdb_env_set_mapsize(ptr, map_size))?;
+            check(ffi::mdb_env_set_maxdbs(ptr, max_dbs))?;
+            check(ffi::mdb_env_set_maxreaders(ptr, max_readers))?;
+            // NOTLS: read transactions belong to no thread, so they can run on
+            // any thread. NORDAHEAD: lookups are random, so read-ahead mostly
+            // wastes page cache once the map outgrows RAM.
+            let flags = flags | ffi::MDB_NOTLS | ffi::MDB_NORDAHEAD;
+            check(ffi::mdb_env_open(ptr, path.as_ptr(), flags, 0o600))
+        }
+    }
+
+    /// Flush every environment's file to disk, the last environment first.
+    /// Safe to call while others read and write.
+    pub fn sync(&self) -> Result<()> {
+        for &env in self.ptrs.iter().rev() {
+            // SAFETY: the env is open; 1 forces the flush.
+            check(unsafe { ffi::mdb_env_sync(env, 1) })?;
+        }
+        Ok(())
+    }
+
+    /// Open a table, creating it if need be, or if the environment is
+    /// [read-only](Self::open_read_only), only if it exists. Call these at
+    /// startup, before any other transaction: LMDB forbids opening tables
+    /// concurrently.
+    pub fn create_db(&self, name: &str, flags: DbFlags) -> Result<Db> {
+        self.create_db_in(0, name, flags)
+    }
+
+    /// Open a table in the environment `env`, as [`create_db`](Self::create_db).
+    pub fn create_db_in(&self, env: usize, name: &str, flags: DbFlags) -> Result<Db> {
+        let name = CString::new(name).map_err(|_| Error(libc::EINVAL))?;
+        let (txn, bits) = match self.read_only {
+            true => (self.begin(ffi::MDB_RDONLY)?, flags.bits()),
+            false => (self.write_txn()?.0, flags.bits() | ffi::MDB_CREATE),
+        };
+        let mut dbi = 0;
+        // SAFETY: a live transaction and a NUL-terminated name.
+        check(unsafe { ffi::mdb_dbi_open(txn.ptrs[env], name.as_ptr(), bits, &mut dbi) })?;
+        // Committed, even only to read, so the handle outlives it.
+        RwTxn(txn).commit()?;
+        Ok(Db { dbi, env })
+    }
+
+    /// Delete the table `name` in the first environment, if there is one,
+    /// returning how many entries it held.
+    pub fn remove_db(&self, name: &str) -> Result<Option<usize>> {
+        let name = CString::new(name).map_err(|_| Error(libc::EINVAL))?;
+        let txn = self.write_txn()?;
+        let mut dbi = 0;
+        // SAFETY: a live write transaction and a NUL-terminated name.
+        if found(unsafe { ffi::mdb_dbi_open(txn.0.ptrs[0], name.as_ptr(), 0, &mut dbi) })?.is_none()
+        {
+            return Ok(None);
+        }
+        let entries = txn.len(Db { dbi, env: 0 })?;
+        // SAFETY: a live write transaction; 1 deletes the table and closes
+        // its handle, which nothing else holds.
+        check(unsafe { ffi::mdb_drop(txn.0.ptrs[0], dbi, 1) })?;
+        txn.commit()?;
+        Ok(Some(entries))
+    }
+
+    /// Every table in the first environment, opened, with its flags, in
+    /// the order of their names. Like [`create_db`](Self::create_db), call
+    /// it before any other transaction.
+    pub fn tables(&self) -> Result<Vec<(String, Db, DbFlags)>> {
+        let txn = self.begin(ffi::MDB_RDONLY)?;
+        let ptr = txn.ptrs[0];
+        let mut main = 0;
+        // SAFETY: a live transaction; a null name is the table of tables.
+        check(unsafe { ffi::mdb_dbi_open(ptr, ptr::null(), 0, &mut main) })?;
+        let mut names = Vec::new();
+        let mut cursor = txn.cursor(Db { dbi: main, env: 0 })?;
+        let mut entry = cursor.first()?;
+        while let Some((name, _)) = entry {
+            names.push(String::from_utf8(name.to_vec()).map_err(|_| Error(ffi::MDB_INCOMPATIBLE))?);
+            entry = cursor.next()?;
+        }
+        drop(cursor);
+        let mut tables = Vec::new();
+        for name in names {
+            let c_name = CString::new(name.as_str()).map_err(|_| Error(ffi::MDB_INCOMPATIBLE))?;
+            let (mut dbi, mut bits) = (0, 0);
+            // SAFETY: a live transaction and a NUL-terminated name. An
+            // existing table's flags are its own, whatever's passed.
+            check(unsafe { ffi::mdb_dbi_open(ptr, c_name.as_ptr(), 0, &mut dbi) })?;
+            check(unsafe { ffi::mdb_dbi_flags(ptr, dbi, &mut bits) })?;
+            tables.push((name, Db { dbi, env: 0 }, DbFlags::from_bits(bits)?));
+        }
+        // Committed, so the handles outlive it.
+        RwTxn(txn).commit()?;
+        Ok(tables)
+    }
+
+    /// Write a compacted copy of the environment `env` into the directory
+    /// `path`.
+    #[cfg(test)]
+    pub fn copy_compact(&self, env: usize, path: &Path) -> Result<()> {
+        let path =
+            CString::new(path.as_os_str().as_encoded_bytes()).map_err(|_| Error(libc::EINVAL))?;
+        // SAFETY: the env is open and the path NUL-terminated.
+        check(unsafe { ffi::mdb_env_copy2(self.ptrs[env], path.as_ptr(), ffi::MDB_CP_COMPACT) })
+    }
+
+    /// How big the environment `env`'s map is, and how much of it is used,
+    /// in bytes.
+    pub fn usage(&self, env: usize) -> Result<Usage> {
+        let ptr = self.ptrs[env];
+        // SAFETY: plain data, filled in by LMDB from an open env.
+        let mut info = unsafe { std::mem::zeroed::<ffi::MDB_envinfo>() };
+        let mut stat = unsafe { std::mem::zeroed::<ffi::MDB_stat>() };
+        check(unsafe { ffi::mdb_env_info(ptr, &mut info) })?;
+        check(unsafe { ffi::mdb_env_stat(ptr, &mut stat) })?;
+        Ok(Usage {
+            map: info.me_mapsize as u64,
+            used: (info.me_last_pgno as u64 + 1) * u64::from(stat.ms_psize),
+        })
+    }
+
+    /// Have the kernel start reading the `len` bytes of environment
+    /// `env`'s file from where `at`, read from its map, is, so that reading
+    /// on from there in order doesn't wait on the disk a page at a time:
+    /// environments are opened without the kernel's readahead, which
+    /// random lookups have no use for. Only a hint, so failing is no error.
+    pub fn will_need(&self, env: usize, at: &[u8], len: usize) {
+        let ptr = self.ptrs[env];
+        // SAFETY: plain data, filled in by LMDB from an open env.
+        let mut info = unsafe { std::mem::zeroed::<ffi::MDB_envinfo>() };
+        let mut fd = -1;
+        if check(unsafe { ffi::mdb_env_info(ptr, &mut info) }).is_err()
+            || check(unsafe { ffi::mdb_env_get_fd(ptr, &mut fd) }).is_err()
+        {
+            return;
+        }
+        let Some(offset) = (at.as_ptr() as usize).checked_sub(info.me_mapaddr as usize) else {
+            return;
+        };
+        if offset >= info.me_mapsize {
+            return;
+        }
+        // SAFETY: advice on a file LMDB holds open; nothing is read or
+        // written through any pointer.
+        unsafe {
+            libc::posix_fadvise(
+                fd,
+                offset as libc::off_t,
+                len as libc::off_t,
+                libc::POSIX_FADV_WILLNEED,
+            );
+        }
+    }
+
+    /// A read transaction kept between uses with `mdb_txn_reset`, so
+    /// beginning one again (`mdb_txn_renew`) keeps its reader slots rather
+    /// than taking the lock that hands slots out: with it, lookups scale
+    /// with threads (spike 2b measured 2.3x on eight).
+    pub fn reader(&self) -> Result<Reader<'_>> {
+        let txn = self.begin(ffi::MDB_RDONLY)?;
+        for &ptr in txn.ptrs.iter().filter(|p| !p.is_null()) {
+            // SAFETY: a live read transaction, reset to be renewed later.
+            unsafe { ffi::mdb_txn_reset(ptr) };
+        }
+        let ptrs = txn.ptrs;
+        std::mem::forget(txn);
+        Ok(Reader {
+            ptrs,
+            _env: PhantomData,
+        })
+    }
+
+    pub fn read_txn(&self) -> Result<RoTxn<'_>> {
+        Ok(RoTxn(self.begin(ffi::MDB_RDONLY)?))
+    }
+
+    pub fn write_txn(&self) -> Result<RwTxn<'_>> {
+        Ok(RwTxn(self.begin(0)?))
+    }
+
+    /// A transaction in each environment, in the order they were opened.
+    fn begin(&self, flags: u32) -> Result<Txn<'_>> {
+        let mut txn = Txn {
+            ptrs: [ptr::null_mut(); MAX_ENVS],
+            _env: PhantomData,
+        };
+        for (env, slot) in self.ptrs.iter().zip(&mut txn.ptrs) {
+            // SAFETY: the env is open; the transaction is freed by Txn's
+            // drop or commit, those already begun too if this fails.
+            check(unsafe { ffi::mdb_txn_begin(*env, ptr::null_mut(), flags, slot) })?;
+        }
+        Ok(txn)
+    }
+}
+
+impl Drop for Env {
+    fn drop(&mut self) {
+        for &ptr in &self.ptrs {
+            // SAFETY: every transaction borrows the env, so none outlives it.
+            unsafe { ffi::mdb_env_close(ptr) }
+        }
+    }
+}
+
+/// What reading needs, shared by both kinds of transaction. Values read
+/// borrow the transaction, so a write (which takes `&mut`) can't leave one
+/// dangling.
+pub struct Txn<'env> {
+    /// One per environment, null past the last.
+    ptrs: [*mut ffi::MDB_txn; MAX_ENVS],
+    _env: PhantomData<&'env Env>,
+}
+
+impl Txn<'_> {
+    /// The transaction in `db`'s environment.
+    fn of(&self, db: Db) -> *mut ffi::MDB_txn {
+        self.ptrs[db.env]
+    }
+
+    pub fn get(&self, db: Db, key: &[u8]) -> Result<Option<&[u8]>> {
+        let (mut k, mut v) = (val(key), empty());
+        // SAFETY: a live transaction; the value is valid while `self` is borrowed.
+        Ok(
+            found(unsafe { ffi::mdb_get(self.of(db), db.dbi, &mut k, &mut v) })?
+                .map(|()| unsafe { bytes(&v) }),
+        )
+    }
+
+    pub fn cursor(&self, db: Db) -> Result<Cursor<'_>> {
+        let mut ptr = ptr::null_mut();
+        // SAFETY: a live transaction; the cursor is closed on drop, before the txn ends.
+        check(unsafe { ffi::mdb_cursor_open(self.of(db), db.dbi, &mut ptr) })?;
+        Ok(Cursor {
+            ptr,
+            _txn: PhantomData,
+        })
+    }
+
+    /// How `a` and `b` compare as `db`'s keys.
+    pub fn cmp(&self, db: Db, a: &[u8], b: &[u8]) -> std::cmp::Ordering {
+        let (a, b) = (val(a), val(b));
+        // SAFETY: a live transaction; LMDB only reads the two values.
+        unsafe { ffi::mdb_cmp(self.of(db), db.dbi, &a, &b) }.cmp(&0)
+    }
+
+    /// How many entries `db` holds, counting each duplicate.
+    pub fn len(&self, db: Db) -> Result<usize> {
+        // SAFETY: MDB_stat is plain data, filled in by LMDB.
+        let mut stat = unsafe { std::mem::zeroed::<ffi::MDB_stat>() };
+        check(unsafe { ffi::mdb_stat(self.of(db), db.dbi, &mut stat) })?;
+        Ok(stat.ms_entries)
+    }
+}
+
+impl Drop for Txn<'_> {
+    fn drop(&mut self) {
+        for &ptr in &self.ptrs {
+            if !ptr.is_null() {
+                // SAFETY: not yet committed or aborted.
+                unsafe { ffi::mdb_txn_abort(ptr) }
+            }
+        }
+    }
+}
+
+/// See [`Env::reader`].
+pub struct Reader<'env> {
+    /// One per environment, null past the last; reset between uses.
+    ptrs: [*mut ffi::MDB_txn; MAX_ENVS],
+    _env: PhantomData<&'env Env>,
+}
+
+impl Reader<'_> {
+    /// Run `f` in a fresh snapshot, then let the snapshot go.
+    pub fn read<R>(&mut self, f: impl FnOnce(&Txn<'_>) -> R) -> Result<R> {
+        let live = self.ptrs.iter().filter(|p| !p.is_null()).count();
+        for i in 0..live {
+            // SAFETY: a reset read transaction, renewed in the order the
+            // environments were opened, as `Env::begin` begins them.
+            if let Err(e) = check(unsafe { ffi::mdb_txn_renew(self.ptrs[i]) }) {
+                for &ptr in &self.ptrs[..i] {
+                    unsafe { ffi::mdb_txn_reset(ptr) };
+                }
+                return Err(e);
+            }
+        }
+        let txn = std::mem::ManuallyDrop::new(Txn {
+            ptrs: self.ptrs,
+            _env: PhantomData,
+        });
+        let r = f(&txn);
+        for &ptr in &self.ptrs[..live] {
+            // SAFETY: renewed above; reset, not freed, to be renewed again.
+            unsafe { ffi::mdb_txn_reset(ptr) };
+        }
+        Ok(r)
+    }
+}
+
+impl Drop for Reader<'_> {
+    fn drop(&mut self) {
+        for &ptr in self.ptrs.iter().filter(|p| !p.is_null()) {
+            // SAFETY: reset, not yet aborted.
+            unsafe { ffi::mdb_txn_abort(ptr) }
+        }
+    }
+}
+
+pub struct RoTxn<'env>(Txn<'env>);
+
+// SAFETY: the environments are opened with MDB_NOTLS, so a read-only
+// transaction belongs to no thread and may move to another; not being Sync,
+// it's still only used by one at a time, as LMDB requires.
+unsafe impl Send for RoTxn<'_> {}
+
+impl<'env> std::ops::Deref for RoTxn<'env> {
+    type Target = Txn<'env>;
+    fn deref(&self) -> &Txn<'env> {
+        &self.0
+    }
+}
+
+pub struct RwTxn<'env>(Txn<'env>);
+
+impl<'env> std::ops::Deref for RwTxn<'env> {
+    type Target = Txn<'env>;
+    fn deref(&self) -> &Txn<'env> {
+        &self.0
+    }
+}
+
+impl RwTxn<'_> {
+    /// Store `value` under `key`. In a duplicate-sorted table it's added
+    /// alongside the key's other values. Returns `false`, writing nothing,
+    /// when that exact pair is already there.
+    pub fn put(&mut self, db: Db, key: &[u8], value: &[u8]) -> Result<bool> {
+        self.put_flags(db, key, value, 0)
+    }
+
+    /// Like [`put`](Self::put) for duplicate-sorted tables, where adding a
+    /// pair that's already there is not an error but a no-op.
+    pub fn put_dup(&mut self, db: Db, key: &[u8], value: &[u8]) -> Result<bool> {
+        self.put_flags(db, key, value, ffi::MDB_NODUPDATA)
+    }
+
+    /// Store `value` under `key`, which must sort after every key in the
+    /// table. LMDB then fills pages rather than splitting them in half.
+    /// Returns `false`, writing nothing, if it doesn't.
+    pub fn append(&mut self, db: Db, key: &[u8], value: &[u8]) -> Result<bool> {
+        self.put_flags(db, key, value, ffi::MDB_APPEND)
+    }
+
+    fn put_flags(&mut self, db: Db, key: &[u8], value: &[u8], flags: u32) -> Result<bool> {
+        let (mut k, mut v) = (val(key), val(value));
+        // SAFETY: a live write transaction, and `&mut self` keeps no reads alive.
+        match unsafe { ffi::mdb_put(self.0.of(db), db.dbi, &mut k, &mut v, flags) } {
+            ffi::MDB_KEYEXIST => Ok(false),
+            code => check(code).map(|()| true),
+        }
+    }
+
+    /// A cursor that appends to `db`, for writing a table in order.
+    pub fn appender(&mut self, db: Db) -> Result<Appender<'_>> {
+        let mut ptr = ptr::null_mut();
+        // SAFETY: a live write transaction, borrowed mutably while the
+        // cursor lives; it's closed on drop.
+        check(unsafe { ffi::mdb_cursor_open(self.0.of(db), db.dbi, &mut ptr) })?;
+        Ok(Appender {
+            ptr,
+            _txn: PhantomData,
+        })
+    }
+
+    /// Remove a key and all its values, or with `value`, just that one value
+    /// of a duplicate-sorted key. Returns whether anything was there.
+    pub fn del(&mut self, db: Db, key: &[u8], value: Option<&[u8]>) -> Result<bool> {
+        let mut k = val(key);
+        let mut v = value.map(val);
+        let v_ptr = v.as_mut().map_or(ptr::null_mut(), |v| v as *mut _);
+        // SAFETY: a live write transaction; a null data pointer means "every value".
+        Ok(found(unsafe { ffi::mdb_del(self.0.of(db), db.dbi, &mut k, v_ptr) })?.is_some())
+    }
+
+    /// Remove every entry of a table, keeping the table.
+    pub fn clear(&mut self, db: Db) -> Result<()> {
+        // SAFETY: a live write transaction; 0 empties the table without
+        // closing its handle.
+        check(unsafe { ffi::mdb_drop(self.0.of(db), db.dbi, 0) })
+    }
+
+    /// Commit, the last environment opened first. If one fails, those not
+    /// yet committed are aborted.
+    pub fn commit(mut self) -> Result<()> {
+        for slot in self.0.ptrs.iter_mut().rev() {
+            if slot.is_null() {
+                continue;
+            }
+            let ptr = std::mem::replace(slot, ptr::null_mut());
+            // SAFETY: commit frees the transaction whatever it returns, so
+            // it's nulled first to keep Drop from aborting it again.
+            check(unsafe { ffi::mdb_txn_commit(ptr) })?;
+        }
+        Ok(())
+    }
+}
+
+/// A position in one table. Every move returns the entry it lands on, or
+/// `None` if there's none there.
+pub struct Cursor<'t> {
+    ptr: *mut ffi::MDB_cursor,
+    _txn: PhantomData<&'t Txn<'t>>,
+}
+
+pub type Entry<'t> = (&'t [u8], &'t [u8]);
+
+impl<'t> Cursor<'t> {
+    fn op(
+        &mut self,
+        key: Option<&[u8]>,
+        value: Option<&[u8]>,
+        op: ffi::MDB_cursor_op,
+    ) -> Result<Option<Entry<'t>>> {
+        let mut k = key.map_or_else(empty, val);
+        let mut v = value.map_or_else(empty, val);
+        // SAFETY: a live cursor; returned slices live as long as the transaction.
+        let hit = found(unsafe { ffi::mdb_cursor_get(self.ptr, &mut k, &mut v, op) })?;
+        Ok(hit.map(|()| unsafe { (bytes(&k), bytes(&v)) }))
+    }
+
+    /// The first entry of `key` exactly.
+    pub fn set(&mut self, key: &[u8]) -> Result<Option<Entry<'t>>> {
+        self.op(Some(key), None, ffi::MDB_SET_KEY)
+    }
+
+    /// Within `key`'s duplicates, the first value at least `value`.
+    pub fn get_both_range(&mut self, key: &[u8], value: &[u8]) -> Result<Option<Entry<'t>>> {
+        self.op(Some(key), Some(value), ffi::MDB_GET_BOTH_RANGE)
+    }
+
+    /// The first entry whose key is at least `key`.
+    pub fn set_range(&mut self, key: &[u8]) -> Result<Option<Entry<'t>>> {
+        self.op(Some(key), None, ffi::MDB_SET_RANGE)
+    }
+
+    pub fn first(&mut self) -> Result<Option<Entry<'t>>> {
+        self.op(None, None, ffi::MDB_FIRST)
+    }
+
+    /// The last entry, the last value of the last key.
+    pub fn last(&mut self) -> Result<Option<Entry<'t>>> {
+        self.op(None, None, ffi::MDB_LAST)
+    }
+
+    #[allow(clippy::should_implement_trait)]
+    pub fn next(&mut self) -> Result<Option<Entry<'t>>> {
+        self.op(None, None, ffi::MDB_NEXT)
+    }
+
+    pub fn prev(&mut self) -> Result<Option<Entry<'t>>> {
+        self.op(None, None, ffi::MDB_PREV)
+    }
+
+    /// The last value of the current key.
+    pub fn last_dup(&mut self) -> Result<Option<Entry<'t>>> {
+        // MDB_LAST_DUP returns only the value; the key is unchanged.
+        let hit = self.op(None, None, ffi::MDB_LAST_DUP)?;
+        Ok(hit.map(|(_, v)| (&[][..], v)))
+    }
+
+    /// The next value of the current key, not crossing into another.
+    pub fn next_dup(&mut self) -> Result<Option<Entry<'t>>> {
+        self.op(None, None, ffi::MDB_NEXT_DUP)
+    }
+
+    /// The previous value of the current key, not crossing into another.
+    pub fn prev_dup(&mut self) -> Result<Option<Entry<'t>>> {
+        self.op(None, None, ffi::MDB_PREV_DUP)
+    }
+
+    /// The first entry of the next key.
+    pub fn next_nodup(&mut self) -> Result<Option<Entry<'t>>> {
+        self.op(None, None, ffi::MDB_NEXT_NODUP)
+    }
+
+    /// In a `DUP_FIXED` table, the whole page of values the cursor is on,
+    /// packed — from the page's start, which may be before the cursor —
+    /// leaving the cursor on its last. Empty when the key has only the one
+    /// value, which LMDB keeps outside any page: it's the one the cursor is
+    /// on.
+    pub fn get_multiple(&mut self) -> Result<&'t [u8]> {
+        Ok(self
+            .op(None, None, ffi::MDB_GET_MULTIPLE)?
+            .map_or(&[][..], |(_, v)| v))
+    }
+
+    /// The next page of the current key's values, as
+    /// [`get_multiple`](Self::get_multiple) returns them.
+    pub fn next_multiple(&mut self) -> Result<Option<&'t [u8]>> {
+        Ok(self.op(None, None, ffi::MDB_NEXT_MULTIPLE)?.map(|(_, v)| v))
+    }
+
+    /// The page of the current key's values before the one
+    /// [`get_multiple`](Self::get_multiple) or this last returned, as
+    /// that returns them.
+    pub fn prev_multiple(&mut self) -> Result<Option<&'t [u8]>> {
+        Ok(self.op(None, None, ffi::MDB_PREV_MULTIPLE)?.map(|(_, v)| v))
+    }
+
+    /// How many values the current key has.
+    pub fn count(&mut self) -> Result<usize> {
+        let mut count = 0;
+        // SAFETY: a live, positioned cursor on a duplicate-sorted table.
+        check(unsafe { ffi::mdb_cursor_count(self.ptr, &mut count) })?;
+        Ok(count)
+    }
+}
+
+impl Drop for Cursor<'_> {
+    fn drop(&mut self) {
+        // SAFETY: the cursor's transaction is still alive (it's borrowed).
+        unsafe { ffi::mdb_cursor_close(self.ptr) }
+    }
+}
+
+/// A cursor writing a table in order, from [`RwTxn::appender`]. LMDB fills
+/// each page before starting the next, rather than splitting them in half.
+/// Anything out of order is refused with `MDB_KEYEXIST`.
+pub struct Appender<'t> {
+    ptr: *mut ffi::MDB_cursor,
+    _txn: PhantomData<&'t mut ()>,
+}
+
+impl Appender<'_> {
+    /// Store `value` under `key`, which must sort after every key in the
+    /// table.
+    pub fn append(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
+        let (mut k, mut v) = (val(key), val(value));
+        // SAFETY: a live cursor of a live write transaction.
+        check(unsafe { ffi::mdb_cursor_put(self.ptr, &mut k, &mut v, ffi::MDB_APPEND) })
+    }
+
+    /// In a `DUP_FIXED` table, store `values`, packed, each `size` bytes and
+    /// in order, under `key`, after its other values. With `new`, `key` must
+    /// sort after every key in the table; else it must be the last.
+    pub fn append_dups(&mut self, key: &[u8], values: &[u8], size: usize, new: bool) -> Result<()> {
+        if size == 0 || values.is_empty() || !values.len().is_multiple_of(size) {
+            return Err(Error(libc::EINVAL));
+        }
+        let count = values.len() / size;
+        let mut k = val(key);
+        // MDB_MULTIPLE: the first the size and where, the second how many.
+        let mut data = [
+            ffi::MDB_val {
+                mv_size: size,
+                mv_data: values.as_ptr() as *mut _,
+            },
+            ffi::MDB_val {
+                mv_size: count,
+                mv_data: ptr::null_mut(),
+            },
+        ];
+        let mut flags = ffi::MDB_MULTIPLE | ffi::MDB_APPENDDUP;
+        if new {
+            flags |= ffi::MDB_APPEND;
+        }
+        // SAFETY: a live cursor of a live write transaction; LMDB reads
+        // `count` values of `size` bytes from `values`, and writes into
+        // `data[1]` how many it stored.
+        check(unsafe { ffi::mdb_cursor_put(self.ptr, &mut k, data.as_mut_ptr(), flags) })?;
+        match data[1].mv_size == count {
+            true => Ok(()),
+            false => Err(Error(ffi::MDB_PROBLEM)),
+        }
+    }
+}
+
+impl Drop for Appender<'_> {
+    fn drop(&mut self) {
+        // SAFETY: the cursor's transaction is still alive (it's borrowed).
+        unsafe { ffi::mdb_cursor_close(self.ptr) }
+    }
+}
+
+fn sync_flags(sync: Sync) -> u32 {
+    match sync {
+        Sync::Durable => 0,
+        Sync::Lazy => ffi::MDB_NOSYNC,
+    }
+}
