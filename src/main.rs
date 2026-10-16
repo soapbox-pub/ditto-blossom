@@ -2,21 +2,28 @@
 
 mod access;
 mod app;
+mod auth;
 mod blobs;
+mod compress;
 mod config;
 #[cfg(test)]
 mod e2e;
 mod hash;
 mod http;
 mod import;
+mod ingest;
+mod limits;
 mod lmdb;
 mod log;
 mod mime;
+mod mirror;
 mod routes;
 mod send_file;
 mod serve;
 mod server;
 mod store;
+mod upload;
+mod writer;
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -90,7 +97,9 @@ fn run() -> Result<()> {
 fn serve(config: Config) -> Result<()> {
     raise_nofile();
     install_crypto();
-    let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
     runtime.block_on(async move {
         let app = app::App::open(config)?;
         let listener = tokio::net::TcpListener::bind(app.config.listen)
@@ -123,7 +132,8 @@ async fn flush_access(app: &'static app::App, shutdown: CancellationToken) {
         if seqs.is_empty() {
             continue;
         }
-        let result = tokio::task::spawn_blocking(move || app.store.touch(&seqs, access::today())).await;
+        let result =
+            tokio::task::spawn_blocking(move || app.store.touch(&seqs, access::today())).await;
         if let Ok(Err(e)) = result {
             crate::warn!("access_flush_failed", "error": format!("{e:#}"));
         }
@@ -132,7 +142,12 @@ async fn flush_access(app: &'static app::App, shutdown: CancellationToken) {
 
 async fn stop_on_signal(shutdown: CancellationToken) {
     use tokio::signal::unix::{SignalKind, signal};
-    let (Ok(mut term), Ok(mut int)) = (signal(SignalKind::terminate()), signal(SignalKind::interrupt())) else { return };
+    let (Ok(mut term), Ok(mut int)) = (
+        signal(SignalKind::terminate()),
+        signal(SignalKind::interrupt()),
+    ) else {
+        return;
+    };
     tokio::select! {
         _ = term.recv() => {}
         _ = int.recv() => {}
@@ -151,7 +166,10 @@ pub fn install_crypto() {
 
 /// Mapped blobs hold their files open, so allow as many as the hard limit.
 fn raise_nofile() {
-    let mut lim = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+    let mut lim = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
     // SAFETY: plain syscalls on a local struct.
     unsafe {
         if libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) == 0 {

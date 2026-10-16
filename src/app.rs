@@ -1,28 +1,53 @@
-//! What every request reaches: config, the store, files, and the writer.
+//! What every request reaches: config, the store, files, the writer and
+//! the background workers.
 
 use anyhow::Result;
 
 use crate::access::Access;
+use crate::auth::Verifier;
 use crate::blobs::Files;
+use crate::compress::Compressor;
 use crate::config::Config;
+use crate::limits::RateLimit;
 use crate::store::Store;
+use crate::writer::Writer;
 
 pub struct App {
     pub config: Config,
-    /// `public_url`'s hostname, which `server` tags must name.
-    pub domain: String,
     pub store: &'static Store,
-    pub files: Files,
+    pub files: &'static Files,
     pub access: Access,
+    pub writer: Writer,
+    pub auth: Verifier,
+    pub upload_limit: RateLimit,
+    pub compressor: Compressor,
+    /// What mirrors fetch with.
+    pub http: reqwest::Client,
 }
 
 impl App {
-    /// Open everything under the config's data directory. Leaked: it lives
-    /// as long as the process, and requests borrow it for good.
+    /// Open everything under the config's data directory and start the
+    /// writer and compressor threads. Leaked: it lives as long as the
+    /// process, and requests borrow it for good.
     pub fn open(config: Config) -> Result<&'static App> {
-        let store = Box::leak(Box::new(Store::open(&config.data)?));
-        let files = Files::open(&config.data, config.open_files)?;
-        let domain = config.domain()?;
-        Ok(Box::leak(Box::new(App { config, domain, store, files, access: Access::default() })))
+        crate::install_crypto();
+        let store: &'static Store = Box::leak(Box::new(Store::open(&config.data)?));
+        let files: &'static Files =
+            Box::leak(Box::new(Files::open(&config.data, config.open_files)?));
+        let writer = Writer::start(store, files);
+        let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+        let compressor = Compressor::start(store, files, writer.clone(), (threads / 2).max(1));
+        let http = crate::mirror::client(config.mirror.allow_private);
+        Ok(Box::leak(Box::new(App {
+            auth: Verifier::new(config.domain()?),
+            upload_limit: RateLimit::new(config.upload.per_minute),
+            config,
+            store,
+            files,
+            access: Access::default(),
+            writer,
+            compressor,
+            http,
+        })))
     }
 }

@@ -24,7 +24,7 @@
 //! transaction per lookup on eight threads.
 
 use std::cell::RefCell;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 use bytes::Bytes;
@@ -138,7 +138,6 @@ pub struct Store {
     bodies: Db,
     brotli: Db,
     access: Db,
-    pub dir: PathBuf,
 }
 
 thread_local! {
@@ -149,11 +148,29 @@ thread_local! {
 impl Store {
     pub fn open(dir: &Path) -> Result<Store> {
         for sub in ["meta", "inline", "stats"] {
-            std::fs::create_dir_all(dir.join(sub)).with_context(|| format!("Could not create {}", dir.join(sub).display()))?;
+            std::fs::create_dir_all(dir.join(sub))
+                .with_context(|| format!("Could not create {}", dir.join(sub).display()))?;
         }
-        let mut env = Env::open(&dir.join("meta"), lmdb::Sync::Durable, MAP_SIZE, 16, MAX_READERS)
-            .with_context(|| format!("Could not open the database in {}", dir.join("meta").display()))?;
-        let inline = env.attach(&dir.join("inline"), lmdb::Sync::Durable, MAP_SIZE, 4, MAX_READERS)?;
+        let mut env = Env::open(
+            &dir.join("meta"),
+            lmdb::Sync::Durable,
+            MAP_SIZE,
+            16,
+            MAX_READERS,
+        )
+        .with_context(|| {
+            format!(
+                "Could not open the database in {}",
+                dir.join("meta").display()
+            )
+        })?;
+        let inline = env.attach(
+            &dir.join("inline"),
+            lmdb::Sync::Durable,
+            MAP_SIZE,
+            4,
+            MAX_READERS,
+        )?;
         let info = env.create_db("info", DbFlags::PLAIN)?;
         let store_env_tables = (
             env.create_db("blobs", DbFlags::INTEGER_KEY)?,
@@ -172,12 +189,27 @@ impl Store {
                     txn.commit()?;
                 }
                 Some(v) if v == VERSION => {}
-                Some(v) => bail!("The database is version {}, this server reads {}", String::from_utf8_lossy(v), String::from_utf8_lossy(VERSION)),
+                Some(v) => bail!(
+                    "The database is version {}, this server reads {}",
+                    String::from_utf8_lossy(v),
+                    String::from_utf8_lossy(VERSION)
+                ),
             }
         }
         let (stats, access) = open_stats(&dir.join("stats"))?;
         let (blobs, ids, owners, blob_owners, reports, bodies, brotli) = store_env_tables;
-        Ok(Store { env, stats, blobs, ids, owners, blob_owners, reports, bodies, brotli, access, dir: dir.to_path_buf() })
+        Ok(Store {
+            env,
+            stats,
+            blobs,
+            ids,
+            owners,
+            blob_owners,
+            reports,
+            bodies,
+            brotli,
+            access,
+        })
     }
 
     /// Run `f` in a fresh snapshot of the durable environments, through this
@@ -201,16 +233,31 @@ impl Store {
     /// one, else its own bytes; with them, if they're inline.
     pub fn find(&'static self, hash: &Hash, prefer_brotli: bool) -> Result<Option<Found>> {
         self.read(|txn| -> Result<Option<Found>> {
-            let Some(seq) = self.seq_of(txn, hash)? else { return Ok(None) };
-            let Some(record) = self.record(txn, seq)? else { return Ok(None) };
+            let Some(seq) = self.seq_of(txn, hash)? else {
+                return Ok(None);
+            };
+            let Some(record) = self.record(txn, seq)? else {
+                return Ok(None);
+            };
             let brotli = prefer_brotli && record.has(flag::BROTLI);
-            let inline = if brotli { record.br_size as usize <= INLINE_MAX } else { record.has(flag::INLINE) };
+            let inline = if brotli {
+                record.br_size as usize <= INLINE_MAX
+            } else {
+                record.has(flag::INLINE)
+            };
             let table = if brotli { self.brotli } else { self.bodies };
             let body = match inline {
-                true => txn.get(table, &seq.to_ne_bytes())?.map(Bytes::copy_from_slice),
+                true => txn
+                    .get(table, &seq.to_ne_bytes())?
+                    .map(Bytes::copy_from_slice),
                 false => None,
             };
-            Ok(Some(Found { seq, record, brotli, body }))
+            Ok(Some(Found {
+                seq,
+                record,
+                brotli,
+                body,
+            }))
         })?
     }
 
@@ -222,13 +269,24 @@ impl Store {
     /// A pubkey's blobs, newest first: at most `limit`, uploaded no later
     /// than `until` and no earlier than `since`, and before `after` (a blob
     /// of theirs, as a page's last) if given.
-    pub fn list(&'static self, pubkey: &[u8; 32], after: Option<&Hash>, limit: usize, since: Option<u64>, until: Option<u64>) -> Result<Vec<Record>> {
+    pub fn list(
+        &'static self,
+        pubkey: &[u8; 32],
+        after: Option<&Hash>,
+        limit: usize,
+        since: Option<u64>,
+        until: Option<u64>,
+    ) -> Result<Vec<Record>> {
         self.read(|txn| -> Result<Vec<Record>> {
             // The first stamp not wanted: the cursor's own, or anything after `until`.
             let mut bound: Option<[u8; 10]> = until.map(|u| stamp(u.saturating_add(1), 0));
             if let Some(after) = after {
-                let Some(seq) = self.seq_of(txn, after)? else { return Ok(Vec::new()) };
-                let Some(rec) = self.record(txn, seq)? else { return Ok(Vec::new()) };
+                let Some(seq) = self.seq_of(txn, after)? else {
+                    return Ok(Vec::new());
+                };
+                let Some(rec) = self.record(txn, seq)? else {
+                    return Ok(Vec::new());
+                };
                 let s = stamp(rec.uploaded, seq);
                 bound = Some(bound.map_or(s, |b| b.min(s)));
             }
@@ -261,9 +319,12 @@ impl Store {
         })?
     }
 
+    #[cfg(test)]
     pub fn is_owner(&'static self, hash: &Hash, pubkey: &[u8; 32]) -> Result<bool> {
         self.read(|txn| -> Result<bool> {
-            let Some(seq) = self.seq_of(txn, hash)? else { return Ok(false) };
+            let Some(seq) = self.seq_of(txn, hash)? else {
+                return Ok(false);
+            };
             self.owned_by(txn, seq, pubkey)
         })?
     }
@@ -275,7 +336,9 @@ impl Store {
     }
 
     pub fn seq_of(&self, txn: &Txn<'_>, hash: &Hash) -> Result<Option<u64>> {
-        Ok(txn.get(self.ids, &hash.0)?.map(|v| u64::from_le_bytes(v.try_into().unwrap_or_default())))
+        Ok(txn
+            .get(self.ids, &hash.0)?
+            .map(|v| u64::from_le_bytes(v.try_into().unwrap_or_default())))
     }
 
     pub fn record(&self, txn: &Txn<'_>, seq: u64) -> Result<Option<Record>> {
@@ -296,7 +359,13 @@ impl Store {
 
     /// Add a new blob as `seq`, which must be [`next_seq`](Self::next_seq),
     /// with its bytes if it's inline.
-    pub fn insert(&self, txn: &mut RwTxn<'_>, seq: u64, rec: &Record, body: Option<&[u8]>) -> Result<()> {
+    pub fn insert(
+        &self,
+        txn: &mut RwTxn<'_>,
+        seq: u64,
+        rec: &Record,
+        body: Option<&[u8]>,
+    ) -> Result<()> {
         if !txn.append(self.blobs, &seq.to_ne_bytes(), &rec.encode())? {
             bail!("blob {seq} is out of order");
         }
@@ -318,22 +387,37 @@ impl Store {
     }
 
     /// Whether `pubkey` didn't own it already.
-    pub fn add_owner(&self, txn: &mut RwTxn<'_>, seq: u64, uploaded: u64, pubkey: &[u8; 32]) -> Result<bool> {
+    pub fn add_owner(
+        &self,
+        txn: &mut RwTxn<'_>,
+        seq: u64,
+        uploaded: u64,
+        pubkey: &[u8; 32],
+    ) -> Result<bool> {
         let added = txn.put_dup(self.blob_owners, &seq.to_be_bytes(), pubkey)?;
         txn.put_dup(self.owners, pubkey, &stamp(uploaded, seq))?;
         Ok(added)
     }
 
     /// Whether `pubkey` owned it.
-    pub fn remove_owner(&self, txn: &mut RwTxn<'_>, seq: u64, uploaded: u64, pubkey: &[u8; 32]) -> Result<bool> {
+    pub fn remove_owner(
+        &self,
+        txn: &mut RwTxn<'_>,
+        seq: u64,
+        uploaded: u64,
+        pubkey: &[u8; 32],
+    ) -> Result<bool> {
         let removed = txn.del(self.blob_owners, &seq.to_be_bytes(), Some(pubkey))?;
         txn.del(self.owners, pubkey, Some(&stamp(uploaded, seq)))?;
         Ok(removed)
     }
 
+    #[cfg(test)]
     pub fn owned_by(&self, txn: &Txn<'_>, seq: u64, pubkey: &[u8; 32]) -> Result<bool> {
         let mut cur = txn.cursor(self.blob_owners)?;
-        Ok(cur.get_both_range(&seq.to_be_bytes(), pubkey)?.is_some_and(|(_, v)| v == pubkey))
+        Ok(cur
+            .get_both_range(&seq.to_be_bytes(), pubkey)?
+            .is_some_and(|(_, v)| v == pubkey))
     }
 
     pub fn owner_count(&self, txn: &Txn<'_>, seq: u64) -> Result<usize> {
@@ -368,7 +452,13 @@ impl Store {
     }
 
     /// Keep a report (a kind 1984 event's JSON) about a blob. Whether it's new.
-    pub fn put_report(&self, txn: &mut RwTxn<'_>, hash: &Hash, event_id: &[u8; 32], json: &[u8]) -> Result<bool> {
+    pub fn put_report(
+        &self,
+        txn: &mut RwTxn<'_>,
+        hash: &Hash,
+        event_id: &[u8; 32],
+        json: &[u8],
+    ) -> Result<bool> {
         let mut key = [0; 64];
         key[..32].copy_from_slice(&hash.0);
         key[32..].copy_from_slice(event_id);
@@ -398,7 +488,9 @@ impl Store {
                 }
                 Ok(out)
             })??;
-            let Some(&(last, _)) = batch.last() else { return Ok(()) };
+            let Some(&(last, _)) = batch.last() else {
+                return Ok(());
+            };
             let done = batch.len() < chunk;
             for (seq, rec) in batch {
                 f(seq, rec);
@@ -421,9 +513,12 @@ impl Store {
     }
 
     /// The day a blob was last read, if it has been since stats began.
+    #[cfg(test)]
     pub fn last_read(&self, seq: u64) -> Result<Option<u16>> {
         let txn = self.stats.read_txn()?;
-        Ok(txn.get(self.access, &seq.to_ne_bytes())?.and_then(|v| Some(u16::from_le_bytes(v.try_into().ok()?))))
+        Ok(txn
+            .get(self.access, &seq.to_ne_bytes())?
+            .and_then(|v| Some(u16::from_le_bytes(v.try_into().ok()?))))
     }
 
     /// Flush the lazy stats to disk (at shutdown).
@@ -463,7 +558,14 @@ mod tests {
     }
 
     fn rec(n: u8, uploaded: u64) -> Record {
-        Record { hash: Hash::of(&[n]), size: 1, uploaded, mime: Some("text/plain".into()), flags: flag::INLINE, br_size: 0 }
+        Record {
+            hash: Hash::of(&[n]),
+            size: 1,
+            uploaded,
+            mime: Some("text/plain".into()),
+            flags: flag::INLINE,
+            br_size: 0,
+        }
     }
 
     #[test]
@@ -496,13 +598,33 @@ mod tests {
         assert!(store.find(&Hash::of(b"nope"), false).unwrap().is_none());
         assert_eq!(store.count().unwrap(), 5);
 
-        let all: Vec<u64> = store.list(&pk, None, 10, None, None).unwrap().iter().map(|r| r.uploaded).collect();
+        let all: Vec<u64> = store
+            .list(&pk, None, 10, None, None)
+            .unwrap()
+            .iter()
+            .map(|r| r.uploaded)
+            .collect();
         assert_eq!(all, [1004, 1003, 1002, 1001, 1000]);
-        let page: Vec<u64> = store.list(&pk, Some(&Hash::of(&[3])), 2, None, None).unwrap().iter().map(|r| r.uploaded).collect();
+        let page: Vec<u64> = store
+            .list(&pk, Some(&Hash::of(&[3])), 2, None, None)
+            .unwrap()
+            .iter()
+            .map(|r| r.uploaded)
+            .collect();
         assert_eq!(page, [1002, 1001]);
-        let window: Vec<u64> = store.list(&pk, None, 10, Some(1001), Some(1003)).unwrap().iter().map(|r| r.uploaded).collect();
+        let window: Vec<u64> = store
+            .list(&pk, None, 10, Some(1001), Some(1003))
+            .unwrap()
+            .iter()
+            .map(|r| r.uploaded)
+            .collect();
         assert_eq!(window, [1003, 1002, 1001]);
-        assert!(store.list(&[8; 32], None, 10, None, None).unwrap().is_empty());
+        assert!(
+            store
+                .list(&[8; 32], None, 10, None, None)
+                .unwrap()
+                .is_empty()
+        );
         assert!(store.is_owner(&Hash::of(&[2]), &pk).unwrap());
         assert!(!store.is_owner(&Hash::of(&[2]), &[8; 32]).unwrap());
 
@@ -514,5 +636,9 @@ mod tests {
         txn.commit().unwrap();
         assert!(store.find(&Hash::of(&[2]), false).unwrap().is_none());
         assert_eq!(store.list(&pk, None, 10, None, None).unwrap().len(), 4);
+
+        store.touch(&[1, 3], 20_000).unwrap();
+        assert_eq!(store.last_read(3).unwrap(), Some(20_000));
+        assert_eq!(store.last_read(4).unwrap(), None);
     }
 }

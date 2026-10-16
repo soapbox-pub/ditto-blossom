@@ -54,7 +54,9 @@ impl Access {
 
 /// Days since the epoch, which fits a u16 until 2149.
 pub fn today() -> u16 {
-    let secs = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
     (secs / 86400) as u16
 }
 

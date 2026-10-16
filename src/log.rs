@@ -7,7 +7,9 @@ use serde_json::{Map, Value};
 
 pub fn emit(level: &str, msg: &str, fields: Value) {
     let mut obj = Map::new();
-    let t = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64);
+    let t = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64);
     obj.insert("t".into(), t.into());
     obj.insert("level".into(), level.into());
     obj.insert("msg".into(), msg.into());

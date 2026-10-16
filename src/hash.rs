@@ -18,14 +18,19 @@ impl Hash {
             _ => None,
         };
         let mut out = [0; 32];
-        for (i, pair) in hex.chunks_exact(2).enumerate() {
+        for (i, pair) in hex.as_chunks::<2>().0.iter().enumerate() {
             out[i] = digit(pair[0])? << 4 | digit(pair[1])?;
         }
         Some(Hash(out))
     }
 
     pub fn of(data: &[u8]) -> Hash {
-        Hash(ring::digest::digest(&ring::digest::SHA256, data).as_ref().try_into().expect("32 bytes"))
+        Hash(
+            ring::digest::digest(&ring::digest::SHA256, data)
+                .as_ref()
+                .try_into()
+                .expect("32 bytes"),
+        )
     }
 
     pub fn hex(&self) -> String {
@@ -72,7 +77,10 @@ mod tests {
         let hex = h.hex();
         assert_eq!(Hash::parse(hex.as_bytes()), Some(h));
         assert_eq!(Hash::parse(hex.to_uppercase().as_bytes()), Some(h));
-        assert_eq!(hex, "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824");
+        assert_eq!(
+            hex,
+            "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+        );
         assert_eq!(Hash::parse(b"2cf24dba"), None);
         assert_eq!(Hash::parse(&[b'g'; 64]), None);
     }

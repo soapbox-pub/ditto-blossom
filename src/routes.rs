@@ -13,6 +13,7 @@ use crate::hash::Hash;
 use crate::http::{self, error};
 use crate::mime;
 use crate::server::Body;
+use crate::upload;
 
 const LANDING: &str = include_str!("../assets/index.html");
 
@@ -20,7 +21,10 @@ pub async fn handle(app: &'static App, req: Request<Incoming>, peer: SocketAddr)
     let mut response = route(app, req, peer).await;
     let h = response.headers_mut();
     // BUD-01: every response, so browsers on any origin can read blobs.
-    h.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
+    h.insert(
+        header::ACCESS_CONTROL_ALLOW_ORIGIN,
+        HeaderValue::from_static("*"),
+    );
     h.insert(
         header::ACCESS_CONTROL_EXPOSE_HEADERS,
         HeaderValue::from_static("X-Reason, Content-Length, Content-Range, Content-Encoding, ETag"),
@@ -36,14 +40,26 @@ async fn route(app: &'static App, req: Request<Incoming>, peer: SocketAddr) -> R
     }
     match (method, path.as_str()) {
         (Method::GET, "/") => landing(app),
+        (Method::PUT, "/upload") => upload::upload(app, req, peer).await,
+        (Method::HEAD, "/upload") => upload::head_upload(app, &req),
+        (Method::PUT, "/mirror") => crate::mirror::mirror(app, req, peer).await,
+        (Method::PUT, "/report") => upload::report(app, req, peer).await,
+        (Method::PUT | Method::HEAD, "/media") => error(
+            StatusCode::NOT_FOUND,
+            "Media optimization (BUD-05) isn't offered here",
+        ),
+        (Method::GET, p) if p.starts_with("/list/") => {
+            upload::list(app, &req, &p["/list/".len()..])
+        }
+        (Method::DELETE, p) => match blob_path(p) {
+            Some(hash) => upload::delete(app, &req, hash).await,
+            None => error(StatusCode::NOT_FOUND, "Not found"),
+        },
         (Method::GET | Method::HEAD, p) => match blob_path(p) {
             Some(hash) => crate::serve::blob(app, &req, hash).await,
             None => error(StatusCode::NOT_FOUND, "Not found"),
         },
-        _ => {
-            let _ = client_ip(app, &req, peer);
-            error(StatusCode::NOT_FOUND, "Not found")
-        }
+        _ => error(StatusCode::METHOD_NOT_ALLOWED, "Method not allowed"),
     }
 }
 
@@ -60,18 +76,35 @@ pub fn blob_path(path: &str) -> Option<Hash> {
 fn preflight() -> Response<Body> {
     let mut r = http::empty(StatusCode::NO_CONTENT);
     let h = r.headers_mut();
-    h.insert(header::ACCESS_CONTROL_ALLOW_HEADERS, HeaderValue::from_static("Authorization, *"));
-    h.insert(header::ACCESS_CONTROL_ALLOW_METHODS, HeaderValue::from_static("GET, HEAD, PUT, DELETE"));
-    h.insert(header::ACCESS_CONTROL_MAX_AGE, HeaderValue::from_static("86400"));
+    h.insert(
+        header::ACCESS_CONTROL_ALLOW_HEADERS,
+        HeaderValue::from_static("Authorization, *"),
+    );
+    h.insert(
+        header::ACCESS_CONTROL_ALLOW_METHODS,
+        HeaderValue::from_static("GET, HEAD, PUT, DELETE"),
+    );
+    h.insert(
+        header::ACCESS_CONTROL_MAX_AGE,
+        HeaderValue::from_static("86400"),
+    );
     r
 }
 
 fn landing(app: &'static App) -> Response<Body> {
     let count = app.store.count().unwrap_or(0);
-    let page = LANDING.replace("{{public_url}}", &app.config.public_url).replace("{{count}}", &group_digits(count));
+    let page = LANDING
+        .replace("{{public_url}}", &app.config.public_url)
+        .replace("{{count}}", &group_digits(count));
     let mut r = Response::new(Full::new(Bytes::from(page)));
-    r.headers_mut().insert(header::CONTENT_TYPE, HeaderValue::from_static("text/html; charset=utf-8"));
-    r.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("public, max-age=60"));
+    r.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/html; charset=utf-8"),
+    );
+    r.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("public, max-age=60"),
+    );
     r
 }
 
@@ -79,7 +112,7 @@ fn group_digits(n: usize) -> String {
     let s = n.to_string();
     let mut out = String::new();
     for (i, c) in s.chars().enumerate() {
-        if i > 0 && (s.len() - i) % 3 == 0 {
+        if i > 0 && (s.len() - i).is_multiple_of(3) {
             out.push(',');
         }
         out.push(c);
@@ -104,7 +137,12 @@ pub fn client_ip(app: &App, req: &Request<Incoming>, peer: SocketAddr) -> IpAddr
 
 /// The URL a blob is served at, with the extension its type gets.
 pub fn blob_url(app: &App, hash: &Hash, ty: Option<&str>) -> String {
-    format!("{}/{}.{}", app.config.public_url, hash.hex(), mime::extension(ty))
+    format!(
+        "{}/{}.{}",
+        app.config.public_url,
+        hash.hex(),
+        mime::extension(ty)
+    )
 }
 
 #[cfg(test)]

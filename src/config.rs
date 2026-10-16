@@ -49,7 +49,7 @@ pub struct Upload {
     pub per_minute: u32,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct List {
     #[serde(default)]
@@ -63,6 +63,11 @@ pub struct List {
 pub struct Mirror {
     #[serde(default = "yes")]
     pub enabled: bool,
+    /// Let mirrors fetch from private and local addresses too. Only for a
+    /// server whose clients may reach everything it can, like one mirroring
+    /// within a private network.
+    #[serde(default)]
+    pub allow_private: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -76,7 +81,10 @@ fn default_listen() -> SocketAddr {
     "127.0.0.1:3000".parse().expect("an address")
 }
 fn default_trusted() -> Vec<IpAddr> {
-    vec!["127.0.0.1".parse().expect("an address"), "::1".parse().expect("an address")]
+    vec![
+        "127.0.0.1".parse().expect("an address"),
+        "::1".parse().expect("an address"),
+    ]
 }
 fn default_open_files() -> usize {
     4096
@@ -93,17 +101,19 @@ fn yes() -> bool {
 
 impl Default for Upload {
     fn default() -> Upload {
-        Upload { require_auth: true, max_size: default_max_size(), per_minute: default_per_minute() }
-    }
-}
-impl Default for List {
-    fn default() -> List {
-        List { enabled: false, require_auth: false }
+        Upload {
+            require_auth: true,
+            max_size: default_max_size(),
+            per_minute: default_per_minute(),
+        }
     }
 }
 impl Default for Mirror {
     fn default() -> Mirror {
-        Mirror { enabled: true }
+        Mirror {
+            enabled: true,
+            allow_private: false,
+        }
     }
 }
 impl Default for Report {
@@ -114,7 +124,8 @@ impl Default for Report {
 
 impl Config {
     pub fn load(path: &Path) -> Result<Config> {
-        let text = std::fs::read_to_string(path).with_context(|| format!("Could not read {}", path.display()))?;
+        let text = std::fs::read_to_string(path)
+            .with_context(|| format!("Could not read {}", path.display()))?;
         Config::parse(&text).with_context(|| format!("{} isn't a valid config", path.display()))
     }
 
@@ -150,7 +161,10 @@ mod tests {
 
     #[test]
     fn defaults_fill_in() {
-        let c = Config::parse("data = \"/srv/blossom\"\npublic_url = \"https://Blossom.Example.com:8443/\"\n").unwrap();
+        let c = Config::parse(
+            "data = \"/srv/blossom\"\npublic_url = \"https://Blossom.Example.com:8443/\"\n",
+        )
+        .unwrap();
         assert_eq!(c.listen, default_listen());
         assert_eq!(c.public_url, "https://Blossom.Example.com:8443");
         assert_eq!(c.domain().unwrap(), "blossom.example.com");
@@ -160,7 +174,9 @@ mod tests {
 
     #[test]
     fn rejects_unknown_settings_and_bad_urls() {
-        assert!(Config::parse("data = \"/x\"\npublic_url = \"https://a\"\nlisten_on = 3\n").is_err());
+        assert!(
+            Config::parse("data = \"/x\"\npublic_url = \"https://a\"\nlisten_on = 3\n").is_err()
+        );
         assert!(Config::parse("data = \"/x\"\npublic_url = \"blossom.example.com\"\n").is_err());
     }
 }

@@ -20,7 +20,10 @@
 //! or [lazy](Sync::Lazy), flushed when the kernel likes and so disposable
 //! after a crash of the machine.
 //!
-//! All the `unsafe` in the crate lives here.
+//! All the `unsafe` in the crate lives here. Kept close to ditto-relay's, so
+//! some of it goes unused here.
+
+#![allow(dead_code)]
 
 use std::ffi::{CStr, CString};
 use std::marker::PhantomData;
@@ -187,7 +190,13 @@ unsafe impl std::marker::Sync for Env {}
 
 impl Env {
     /// Open (creating if need be) the environment in the directory `path`.
-    pub fn open(path: &Path, sync: Sync, map_size: usize, max_dbs: u32, max_readers: u32) -> Result<Env> {
+    pub fn open(
+        path: &Path,
+        sync: Sync,
+        map_size: usize,
+        max_dbs: u32,
+        max_readers: u32,
+    ) -> Result<Env> {
         let mut env = Env::new(false);
         env.add(path, map_size, sync_flags(sync), max_dbs, max_readers)?;
         Ok(env)
@@ -195,7 +204,12 @@ impl Env {
 
     /// Open the existing environment in the directory `path` only to read.
     /// Its tables must exist already, and are opened without writing.
-    pub fn open_read_only(path: &Path, map_size: usize, max_dbs: u32, max_readers: u32) -> Result<Env> {
+    pub fn open_read_only(
+        path: &Path,
+        map_size: usize,
+        max_dbs: u32,
+        max_readers: u32,
+    ) -> Result<Env> {
         let mut env = Env::new(true);
         env.add(path, map_size, ffi::MDB_RDONLY, max_dbs, max_readers)?;
         Ok(env)
@@ -211,7 +225,14 @@ impl Env {
     /// Open (creating if need be) another environment, in the directory
     /// `path`, whose tables share this one's transactions, returning which
     /// it is for [`create_db_in`](Self::create_db_in).
-    pub fn attach(&mut self, path: &Path, sync: Sync, map_size: usize, max_dbs: u32, max_readers: u32) -> Result<usize> {
+    pub fn attach(
+        &mut self,
+        path: &Path,
+        sync: Sync,
+        map_size: usize,
+        max_dbs: u32,
+        max_readers: u32,
+    ) -> Result<usize> {
         assert!(self.ptrs.len() < MAX_ENVS, "too many environments");
         let flags = match self.read_only {
             true => ffi::MDB_RDONLY,
@@ -221,8 +242,16 @@ impl Env {
         Ok(self.ptrs.len() - 1)
     }
 
-    fn add(&mut self, path: &Path, map_size: usize, flags: u32, max_dbs: u32, max_readers: u32) -> Result<()> {
-        let path = CString::new(path.as_os_str().as_encoded_bytes()).map_err(|_| Error(libc::EINVAL))?;
+    fn add(
+        &mut self,
+        path: &Path,
+        map_size: usize,
+        flags: u32,
+        max_dbs: u32,
+        max_readers: u32,
+    ) -> Result<()> {
+        let path =
+            CString::new(path.as_os_str().as_encoded_bytes()).map_err(|_| Error(libc::EINVAL))?;
         let mut ptr = ptr::null_mut();
         // SAFETY: plain FFI calls in the documented order; the env is closed
         // by Drop if any fails, once it's in `ptrs`.

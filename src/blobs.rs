@@ -35,12 +35,20 @@ impl Files {
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp)?;
         let capacity = std::num::NonZeroUsize::new(open_files.max(1)).expect("non-zero");
-        Ok(Files { root, tmp, mapped: Mutex::new(LruCache::new(capacity)) })
+        Ok(Files {
+            root,
+            tmp,
+            mapped: Mutex::new(LruCache::new(capacity)),
+        })
     }
 
     pub fn path(&self, hash: &Hash, brotli: bool) -> PathBuf {
         let hex = hash.hex();
-        let name = if brotli { format!("{hex}.br") } else { hex.clone() };
+        let name = if brotli {
+            format!("{hex}.br")
+        } else {
+            hex.clone()
+        };
         self.root.join(&hex[..2]).join(&hex[2..4]).join(name)
     }
 
@@ -48,10 +56,17 @@ impl Files {
     /// [placed](Self::place).
     pub fn temp(&self) -> io::Result<TempFile> {
         let mut name = [0u8; 12];
-        ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut name).map_err(|_| io::Error::other("no randomness"))?;
+        ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut name)
+            .map_err(|_| io::Error::other("no randomness"))?;
         let path = self.tmp.join(hex::encode(name));
-        let file = OpenOptions::new().write(true).create_new(true).open(&path)?;
-        Ok(TempFile { path, file: Some(file) })
+        let file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)?;
+        Ok(TempFile {
+            path,
+            file: Some(file),
+        })
     }
 
     /// Move a finished temp file (its bytes already flushed) into place,
@@ -97,7 +112,14 @@ impl Files {
             // Start reading it in now, so the sendfile that follows waits on
             // the disk less, on the async thread that makes it.
             // SAFETY: advice on an open file; nothing is read or written.
-            unsafe { libc::posix_fadvise(std::os::fd::AsRawFd::as_raw_fd(&file), 0, 0, libc::POSIX_FADV_WILLNEED) };
+            unsafe {
+                libc::posix_fadvise(
+                    std::os::fd::AsRawFd::as_raw_fd(&file),
+                    0,
+                    0,
+                    libc::POSIX_FADV_WILLNEED,
+                )
+            };
             crate::send_file::bytes(map, file)
         };
         self.mapped.lock().put((seq, brotli), bytes.clone());
@@ -124,7 +146,11 @@ impl Files {
     pub fn adopt(&self, from: &Path, hash: &Hash, copy: bool) -> io::Result<()> {
         let target = self.path(hash, false);
         std::fs::create_dir_all(target.parent().expect("a fanout directory"))?;
-        let r = if copy { std::fs::copy(from, &target).map(|_| ()) } else { std::fs::hard_link(from, &target) };
+        let r = if copy {
+            std::fs::copy(from, &target).map(|_| ())
+        } else {
+            std::fs::hard_link(from, &target)
+        };
         match r {
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(()),
             r => r,
@@ -144,7 +170,11 @@ pub fn sync_dirs(dirs: impl IntoIterator<Item = PathBuf>) -> io::Result<()> {
 /// write per read where the filesystem keeps it. Only a file's owner may
 /// ask for that, so anyone else's opens it plainly.
 pub fn open_noatime(path: &Path) -> io::Result<File> {
-    match OpenOptions::new().read(true).custom_flags(libc::O_NOATIME).open(path) {
+    match OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOATIME)
+        .open(path)
+    {
         Err(e) if e.raw_os_error() == Some(libc::EPERM) => File::open(path),
         r => r,
     }
@@ -161,6 +191,7 @@ impl TempFile {
         self.file.as_mut().expect("open until placed")
     }
 
+    #[cfg(test)]
     pub fn path(&self) -> &Path {
         &self.path
     }

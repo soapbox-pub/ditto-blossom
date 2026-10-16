@@ -52,7 +52,9 @@ struct Registered {
 
 impl Registered {
     fn new(map: memmap2::Mmap, file: std::fs::File) -> Registered {
-        MAPPINGS.write().insert(map.as_ptr() as usize, (map.len(), file.as_raw_fd()));
+        MAPPINGS
+            .write()
+            .insert(map.as_ptr() as usize, (map.len(), file.as_raw_fd()));
         Registered { map, _file: file }
     }
 }

@@ -42,10 +42,18 @@ pub fn run(config: &Config, sqlite: &Path, dir: &Path, copy: bool, verify: bool)
 
     crate::info!("import_listing", "dir": dir.display().to_string());
     let mut on_disk: HashMap<Hash, PathBuf> = HashMap::new();
-    for entry in std::fs::read_dir(dir).with_context(|| format!("Could not read {}", dir.display()))? {
+    for entry in
+        std::fs::read_dir(dir).with_context(|| format!("Could not read {}", dir.display()))?
+    {
         let entry = entry?;
         let name = entry.file_name();
-        let Some(hash) = name.to_str().and_then(|n| n.get(..64)).and_then(|h| Hash::parse(h.as_bytes())) else { continue };
+        let Some(hash) = name
+            .to_str()
+            .and_then(|n| n.get(..64))
+            .and_then(|h| Hash::parse(h.as_bytes()))
+        else {
+            continue;
+        };
         on_disk.insert(hash, entry.path());
     }
 
@@ -55,7 +63,9 @@ pub fn run(config: &Config, sqlite: &Path, dir: &Path, copy: bool, verify: bool)
         let mut rows = q.query([])?;
         while let Some(r) = rows.next()? {
             let (blob, pubkey): (String, String) = (r.get(0)?, r.get(1)?);
-            let (Some(blob), Ok(pk)) = (Hash::parse(blob.as_bytes()), hex::decode(&pubkey)) else { continue };
+            let (Some(blob), Ok(pk)) = (Hash::parse(blob.as_bytes()), hex::decode(&pubkey)) else {
+                continue;
+            };
             if let Ok(pk) = <[u8; 32]>::try_from(pk) {
                 owners.entry(blob).or_default().push(pk);
             }
@@ -63,7 +73,8 @@ pub fn run(config: &Config, sqlite: &Path, dir: &Path, copy: bool, verify: bool)
     }
     crate::info!("import_started", "files": on_disk.len(), "owned_blobs": owners.len());
 
-    let mut q = db.prepare("SELECT sha256, size, type, uploaded FROM blobs ORDER BY uploaded, sha256")?;
+    let mut q =
+        db.prepare("SELECT sha256, size, type, uploaded FROM blobs ORDER BY uploaded, sha256")?;
     let mut rows = q.query([])?;
     let mut counts = Counts::default();
     let mut batch: Vec<(Hash, Option<String>, u64)> = Vec::with_capacity(BATCH);
@@ -78,7 +89,16 @@ pub fn run(config: &Config, sqlite: &Path, dir: &Path, copy: bool, verify: bool)
             }
         }
         if batch.len() == BATCH || (row.is_none() && !batch.is_empty()) {
-            write_batch(store, &files, &batch, &on_disk, &owners, copy, verify, &mut counts)?;
+            write_batch(
+                store,
+                &files,
+                &batch,
+                &on_disk,
+                &owners,
+                copy,
+                verify,
+                &mut counts,
+            )?;
             batch.clear();
             crate::info!("import_progress", "added": counts.added, "present": counts.present, "missing": counts.missing, "corrupt": counts.corrupt);
         }
@@ -116,7 +136,9 @@ fn write_batch(
         let pks = owners.get(hash).unwrap_or(&no_owners);
         if let Some(seq) = store.seq_of(&txn, hash)? {
             counts.present += 1;
-            let rec = store.record(&txn, seq)?.context("a blob without its record")?;
+            let rec = store
+                .record(&txn, seq)?
+                .context("a blob without its record")?;
             for pk in pks {
                 counts.owners += u64::from(store.add_owner(&mut txn, seq, rec.uploaded, pk)?);
             }
@@ -128,7 +150,11 @@ fn write_batch(
         };
         let size = std::fs::metadata(path)?.len();
         let small = size as usize <= INLINE_MAX;
-        let body = if small { Some(std::fs::read(path)?) } else { None };
+        let body = if small {
+            Some(std::fs::read(path)?)
+        } else {
+            None
+        };
         if small || verify {
             let actual = match &body {
                 Some(b) => Hash::of(b),
@@ -153,10 +179,20 @@ fn write_batch(
         if !small {
             files.adopt(path, hash, copy).with_context(|| match copy {
                 true => format!("Could not copy {}", path.display()),
-                false => format!("Could not link {} into place (on another filesystem? then use --copy)", path.display()),
+                false => format!(
+                    "Could not link {} into place (on another filesystem? then use --copy)",
+                    path.display()
+                ),
             })?;
         }
-        let rec = Record { hash: *hash, size, uploaded: *uploaded, mime, flags: if small { flag::INLINE } else { 0 }, br_size: 0 };
+        let rec = Record {
+            hash: *hash,
+            size,
+            uploaded: *uploaded,
+            mime,
+            flags: if small { flag::INLINE } else { 0 },
+            br_size: 0,
+        };
         let seq = store.next_seq(&txn)?;
         store.insert(&mut txn, seq, &rec, body.as_deref())?;
         for pk in pks {

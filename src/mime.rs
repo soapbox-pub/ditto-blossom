@@ -10,8 +10,13 @@ const MAX_LEN: usize = 127;
 pub fn normalize(declared: &str) -> Option<String> {
     let essence = declared.split(';').next()?.trim().to_ascii_lowercase();
     let (ty, sub) = essence.split_once('/')?;
-    let token = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_alphanumeric() || b"!#$&-^_.+".contains(&b));
-    if essence.len() > MAX_LEN || !token(ty) || !token(sub) || essence == "application/octet-stream" {
+    let token = |s: &str| {
+        !s.is_empty()
+            && s.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"!#$&-^_.+".contains(&b))
+    };
+    if essence.len() > MAX_LEN || !token(ty) || !token(sub) || essence == "application/octet-stream"
+    {
         return None;
     }
     Some(essence)
@@ -96,7 +101,10 @@ mod tests {
 
     #[test]
     fn normalizes_declared_types() {
-        assert_eq!(normalize("Text/HTML; charset=utf-8").as_deref(), Some("text/html"));
+        assert_eq!(
+            normalize("Text/HTML; charset=utf-8").as_deref(),
+            Some("text/html")
+        );
         assert_eq!(normalize("image/png").as_deref(), Some("image/png"));
         assert_eq!(normalize("application/octet-stream"), None);
         assert_eq!(normalize("nonsense"), None);
