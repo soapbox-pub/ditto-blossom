@@ -1,0 +1,42 @@
+# ditto-blossom's config. Only `data` and `public_url` are required; the
+# rest are the defaults.
+
+# Plain HTTP; TLS belongs to whatever is in front (a proxy, or a tunnel).
+listen = "127.0.0.1:3000"
+
+# Blobs and the database. Meant for ext4 or xfs: large blobs are sent with
+# sendfile(2), which those make nearly free.
+data = "/var/lib/ditto-blossom"
+
+# Where clients reach the server. Blob URLs begin with it, and auth tokens'
+# `server` tags must name its hostname.
+public_url = "https://blossom.example.com"
+
+# Peers whose X-Forwarded-For is believed (rate limits and logs use the
+# client's address).
+trusted_proxies = ["127.0.0.1", "::1"]
+
+# Blob files kept mapped and open.
+open_files = 4096
+
+# Threads making brotli copies of compressible blobs, at low priority.
+# Unset: half the CPUs. 0: none.
+# compress_threads = 4
+
+[upload]
+require_auth = true
+max_size = 2147483648   # bytes
+per_minute = 60         # uploads and mirrors a client may start
+
+[list]
+enabled = false
+require_auth = false
+
+[mirror]
+enabled = true
+# Let mirrors fetch from private and local addresses (only where clients may
+# reach everything the server can).
+allow_private = false
+
+[report]
+enabled = true

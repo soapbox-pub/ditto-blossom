@@ -112,6 +112,12 @@ pub async fn upload(app: &'static App, req: Request<Incoming>, peer: SocketAddr)
             return http::json(StatusCode::OK, &descriptor(app, &rec));
         }
     }
+    let Ok(_receiving) = app.receiving.try_acquire() else {
+        return error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Too many uploads at once; try again shortly",
+        );
+    };
 
     let declared_type = h
         .get(header::CONTENT_TYPE)

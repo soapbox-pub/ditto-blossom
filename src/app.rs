@@ -12,6 +12,9 @@ use crate::limits::RateLimit;
 use crate::store::Store;
 use crate::writer::Writer;
 
+/// The most uploads and mirrors received at once; more get 503.
+const MAX_RECEIVING: usize = 64;
+
 pub struct App {
     pub config: Config,
     pub store: &'static Store,
@@ -20,6 +23,8 @@ pub struct App {
     pub writer: Writer,
     pub auth: Verifier,
     pub upload_limit: RateLimit,
+    /// Uploads and mirrors receiving at once: each holds a blocking thread.
+    pub receiving: tokio::sync::Semaphore,
     pub compressor: Compressor,
     /// What mirrors fetch with.
     pub http: reqwest::Client,
@@ -42,6 +47,7 @@ impl App {
         Ok(Box::leak(Box::new(App {
             auth: Verifier::new(config.domain()?),
             upload_limit: RateLimit::new(config.upload.per_minute),
+            receiving: tokio::sync::Semaphore::new(MAX_RECEIVING),
             config,
             store,
             files,

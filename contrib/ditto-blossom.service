@@ -1,0 +1,43 @@
+[Unit]
+Description=ditto-blossom, a Blossom server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/ditto-blossom serve -c /etc/ditto-blossom.toml
+User=ditto-blossom
+Group=ditto-blossom
+StateDirectory=ditto-blossom
+Restart=on-failure
+# Mapped blobs hold their files open.
+LimitNOFILE=1048576
+# Gives open connections their moment to finish.
+TimeoutStopSec=20
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/ditto-blossom
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+CapabilityBoundingSet=
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

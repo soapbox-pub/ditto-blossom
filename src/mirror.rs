@@ -95,6 +95,12 @@ pub async fn mirror(app: &'static App, req: Request<Incoming>, peer: SocketAddr)
             "Only public http(s) URLs can be mirrored",
         );
     }
+    let Ok(_receiving) = app.receiving.try_acquire() else {
+        return error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Too many uploads at once; try again shortly",
+        );
+    };
 
     let response = match app.http.get(url.clone()).send().await {
         Ok(r) if r.status().is_success() => r,
