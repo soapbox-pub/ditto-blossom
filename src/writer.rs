@@ -4,23 +4,23 @@
 //! and does it all in one transaction, one durable commit: a commit costs a
 //! couple of flushes whatever it holds, so under load uploads share them
 //! (spike 2b: 64 a commit is 24x the uploads a second). New files are put
-//! in place, and their directories flushed, before the commit that makes
-//! them visible: a blob the database knows of is always whole on disk.
+//! in place and flushed, the batch's together with one `syncfs`, before the
+//! commit that makes them visible: a blob the database knows of is always
+//! whole on disk.
 
-use std::path::PathBuf;
 use std::sync::mpsc;
 
 use anyhow::{Context, Result};
 use tokio::sync::oneshot;
 
-use crate::blobs::{self, Files, TempFile};
+use crate::blobs::{Files, TempFile};
 use crate::hash::Hash;
 use crate::store::{INLINE_MAX, Record, Store, flag};
 
 /// The most jobs one commit takes.
 const MAX_BATCH: usize = 256;
 
-/// A received blob, hashed and (unless small) written to a flushed temp file.
+/// A received blob, hashed and (unless small) written to a temp file.
 pub struct Ingested {
     pub hash: Hash,
     pub size: u64,
@@ -149,7 +149,6 @@ fn run(store: &'static Store, files: &'static Files, rx: mpsc::Receiver<Job>) {
 fn batch(store: &'static Store, files: &'static Files, jobs: Vec<Job>) {
     let mut replies = Vec::with_capacity(jobs.len());
     let mut placed: Vec<(Hash, bool)> = Vec::new();
-    let mut dirs: Vec<PathBuf> = Vec::new();
     let mut unlink: Vec<(u64, Hash)> = Vec::new();
     let mut txn = match store.write_txn() {
         Ok(t) => t,
@@ -158,16 +157,7 @@ fn batch(store: &'static Store, files: &'static Files, jobs: Vec<Job>) {
     for job in jobs {
         match job {
             Job::Insert(blob, owner, now, reply) => {
-                let r = insert(
-                    store,
-                    files,
-                    &mut txn,
-                    blob,
-                    owner,
-                    now,
-                    &mut placed,
-                    &mut dirs,
-                );
+                let r = insert(store, files, &mut txn, blob, owner, now, &mut placed);
                 replies.push(Reply::Insert(reply, r));
             }
             Job::AddOwner(hash, owner, reply) => {
@@ -206,16 +196,7 @@ fn batch(store: &'static Store, files: &'static Files, jobs: Vec<Job>) {
                 replies.push(Reply::Delete(reply, r));
             }
             Job::Brotli(seq, hash, copy) => {
-                if let Err(e) = brotli(
-                    store,
-                    files,
-                    &mut txn,
-                    seq,
-                    hash,
-                    copy,
-                    &mut placed,
-                    &mut dirs,
-                ) {
+                if let Err(e) = brotli(store, files, &mut txn, seq, hash, copy, &mut placed) {
                     crate::warn!("brotli_store_failed", "blob": hash.hex(), "error": format!("{e:#}"));
                 }
             }
@@ -230,9 +211,11 @@ fn batch(store: &'static Store, files: &'static Files, jobs: Vec<Job>) {
             }
         }
     }
-    let committed = blobs::sync_dirs(dirs)
-        .context("Could not flush new blobs' directories")
-        .and_then(|()| Ok(txn.commit()?));
+    let flushed = match placed.is_empty() {
+        true => Ok(()),
+        false => files.sync().context("Could not flush new blobs to disk"),
+    };
+    let committed = flushed.and_then(|()| Ok(txn.commit()?));
     let failed = committed.err().map(|e| format!("{e:#}"));
     match &failed {
         Some(e) => {
@@ -276,7 +259,6 @@ fn insert(
     owner: Option<[u8; 32]>,
     now: u64,
     placed: &mut Vec<(Hash, bool)>,
-    dirs: &mut Vec<PathBuf>,
 ) -> Result<Stored> {
     if let Some(seq) = store.seq_of(txn, &blob.hash)? {
         let record = store
@@ -303,11 +285,9 @@ fn insert(
     match blob.body {
         IngestedBody::Inline(bytes) => store.insert(txn, seq, &record, Some(&bytes))?,
         IngestedBody::File(tmp) => {
-            dirs.extend(
-                files
-                    .place(tmp, &blob.hash, false)
-                    .context("Could not put the blob in place")?,
-            );
+            files
+                .place(tmp, &blob.hash, false)
+                .context("Could not put the blob in place")?;
             placed.push((blob.hash, false));
             store.insert(txn, seq, &record, None)?;
         }
@@ -330,7 +310,6 @@ fn brotli(
     hash: Hash,
     copy: BrotliCopy,
     placed: &mut Vec<(Hash, bool)>,
-    dirs: &mut Vec<PathBuf>,
 ) -> Result<()> {
     // Deleted while it was being compressed: nothing to do.
     let Some(mut rec) = store.record(txn, seq)? else {
@@ -345,7 +324,7 @@ fn brotli(
             rec.br_size = bytes.len() as u64;
         }
         BrotliCopy::File(tmp, size) => {
-            dirs.extend(files.place(tmp, &hash, true)?);
+            files.place(tmp, &hash, true)?;
             placed.push((hash, true));
             rec.flags |= flag::BROTLI;
             rec.br_size = size;

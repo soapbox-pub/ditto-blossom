@@ -6,7 +6,6 @@
 //! and renamed into place, so a half-written blob is never visible. Only
 //! blobs over [`INLINE_MAX`](crate::store::INLINE_MAX) are files.
 
-use std::collections::BTreeSet;
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::os::unix::fs::OpenOptionsExt;
@@ -69,25 +68,28 @@ impl Files {
         })
     }
 
-    /// Move a finished temp file (its bytes already flushed) into place,
-    /// returning the directories whose entries changed: they must be flushed
-    /// before the blob is promised to anyone (see [`sync_dirs`]).
-    pub fn place(&self, mut tmp: TempFile, hash: &Hash, brotli: bool) -> io::Result<Vec<PathBuf>> {
+    /// Move a finished temp file into place. Neither its bytes nor its name
+    /// are on disk for sure until [`sync`](Self::sync).
+    pub fn place(&self, mut tmp: TempFile, hash: &Hash, brotli: bool) -> io::Result<()> {
         let target = self.path(hash, brotli);
-        let leaf = target.parent().expect("a fanout directory");
-        let mid = leaf.parent().expect("a fanout directory");
-        let mut dirs = vec![leaf.to_path_buf()];
-        if !mid.exists() {
-            dirs.push(self.root.clone());
-        }
-        if !leaf.exists() {
-            dirs.push(mid.to_path_buf());
-            std::fs::create_dir_all(leaf)?;
-        }
+        std::fs::create_dir_all(target.parent().expect("a fanout directory"))?;
         drop(tmp.file.take());
         std::fs::rename(&tmp.path, &target)?;
         tmp.path = PathBuf::new();
-        Ok(dirs)
+        Ok(())
+    }
+
+    /// Flush everything written to the blobs' filesystem: every placed
+    /// file's bytes and name, at once. One `syncfs` a batch costs a journal
+    /// commit or two; an fsync per file and per directory cost that each.
+    pub fn sync(&self) -> io::Result<()> {
+        let dir = File::open(&self.root)?;
+        // SAFETY: syncfs on an open descriptor.
+        if unsafe { libc::syncfs(std::os::fd::AsRawFd::as_raw_fd(&dir)) } == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
     }
 
     /// A blob's file, mapped, if the cache has it.
@@ -158,14 +160,6 @@ impl Files {
     }
 }
 
-/// Flush directories' entries to disk, each once.
-pub fn sync_dirs(dirs: impl IntoIterator<Item = PathBuf>) -> io::Result<()> {
-    for dir in dirs.into_iter().collect::<BTreeSet<_>>() {
-        File::open(&dir)?.sync_all()?;
-    }
-    Ok(())
-}
-
 /// Open to read without updating the access time, which costs a metadata
 /// write per read where the filesystem keeps it. Only a file's owner may
 /// ask for that, so anyone else's opens it plainly.
@@ -220,9 +214,8 @@ mod tests {
         let mut tmp = files.temp().unwrap();
         tmp.file().write_all(&data).unwrap();
         let tmp_path = tmp.path().to_path_buf();
-        let dirs = files.place(tmp, &hash, false).unwrap();
-        assert_eq!(dirs.len(), 3, "a new fanout flushes leaf, middle and root");
-        sync_dirs(dirs).unwrap();
+        files.place(tmp, &hash, false).unwrap();
+        files.sync().unwrap();
         assert!(!tmp_path.exists());
         let mapped = files.map(1, &hash, false).unwrap();
         assert_eq!(&mapped[..], &data[..]);

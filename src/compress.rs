@@ -149,6 +149,5 @@ fn compress(
     }
     let mut tmp = files.temp()?;
     tmp.file().write_all(&out)?;
-    tmp.file().sync_data()?;
     Ok(Some((seq, BrotliCopy::File(tmp, out.len() as u64))))
 }

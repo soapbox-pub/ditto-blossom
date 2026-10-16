@@ -46,7 +46,8 @@ pub fn put(app: &'static App, data: &[u8], mime: Option<&str>) -> Hash {
     if !small {
         let mut tmp = app.files.temp().unwrap();
         tmp.file().write_all(data).unwrap();
-        crate::blobs::sync_dirs(app.files.place(tmp, &hash, false).unwrap()).unwrap();
+        app.files.place(tmp, &hash, false).unwrap();
+        app.files.sync().unwrap();
     }
     let mut txn = app.store.write_txn().unwrap();
     let seq = app.store.next_seq(&txn).unwrap();

@@ -1,6 +1,6 @@
 //! Taking in a blob's bytes, from an upload's body or a mirror's download:
 //! counted against the limit, hashed, and (past the inline size) written to
-//! a flushed temp file on a blocking thread, which is also where they're
+//! a temp file on a blocking thread, which is also where they're
 //! hashed, so a big upload never holds an async thread for long.
 
 use std::future::Future;
@@ -21,6 +21,8 @@ use crate::writer::{Ingested, IngestedBody};
 pub const IDLE: Duration = Duration::from_secs(30);
 /// Chunks queued for the blocking writer before reading waits on it.
 const QUEUE: usize = 16;
+/// How much of a large upload is written between nudges to write it out.
+const WRITEBACK_EVERY: usize = 8 << 20;
 
 /// Where a blob's bytes come from.
 pub trait Source: Send {
@@ -149,19 +151,35 @@ pub async fn ingest(
     }
 }
 
-/// Write and hash chunks as they come, then flush: what's renamed into
-/// place later is already on disk.
+/// Write and hash chunks as they come. The writer flushes the file, with
+/// every other in its batch, before anything knows of it.
 fn write_file(files: &Files, mut rx: mpsc::Receiver<Bytes>) -> io::Result<(Hash, TempFile)> {
     let mut tmp = files.temp()?;
     let mut hasher = Hasher::new();
+    let fd = std::os::fd::AsRawFd::as_raw_fd(tmp.file());
     {
         let mut out = io::BufWriter::with_capacity(1 << 20, tmp.file());
+        let mut since_writeback = 0;
         while let Some(chunk) = rx.blocking_recv() {
             hasher.update(&chunk);
             out.write_all(&chunk)?;
+            since_writeback += chunk.len();
+            if since_writeback >= WRITEBACK_EVERY {
+                out.flush()?;
+                start_writeback(fd);
+                since_writeback = 0;
+            }
         }
         out.flush()?;
     }
-    tmp.file().sync_data()?;
+    start_writeback(fd);
     Ok((hasher.finish(), tmp))
+}
+
+/// Have the kernel start writing a file's dirty pages out now, without
+/// waiting: by the time the writer's `syncfs` comes, most are on disk, and
+/// it waits on little.
+fn start_writeback(fd: std::os::fd::RawFd) {
+    // SAFETY: an open descriptor; only asks for writeback to begin.
+    unsafe { libc::sync_file_range(fd, 0, 0, libc::SYNC_FILE_RANGE_WRITE) };
 }

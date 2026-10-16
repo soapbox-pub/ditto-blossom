@@ -1,22 +1,23 @@
 //! Blob metadata, and the bytes of small blobs, in LMDB.
 //!
-//! Two durable environments used as one, `meta` and then `inline`, so the
-//! indexes stay hot apart from small blobs' bytes (as ditto-relay keeps
-//! event bodies apart from its indexes), and a lazy `stats` environment
-//! that a crash may lose. Tables:
+//! A durable environment, `meta`, each commit flushed before it returns,
+//! and a lazy one, `stats`, that a crash may lose. One durable environment,
+//! not ditto-relay's two: each costs its own flushes a commit, and small
+//! blobs' bytes (about 1.5 GB of production's) are in tables of their own
+//! anyway. Tables:
 //!
-//! - `blobs` (meta): seq, a native u64 (`INTEGER_KEY`) -> [`Record`]. Seqs only
-//!   grow, so new records are appended.
-//! - `ids` (meta): sha256 -> seq (u64 LE). Whether a blob is here never reads
-//!   its record.
-//! - `owners` (meta): pubkey -> `DUPFIXED` stamps, uploaded (u32 BE) then seq
-//!   (48 bits BE), so a pubkey's blobs sort oldest first: `/list` pages and
-//!   counts per pubkey come straight from the index.
-//! - `blob_owners` (meta): seq (u64 BE) -> `DUPFIXED` pubkeys.
-//! - `reports` (meta): sha256 then the report's event id -> its JSON.
-//! - `info` (meta): `version` -> the layout's version.
-//! - `bodies` (inline): seq -> the bytes of a blob up to [`INLINE_MAX`].
-//! - `brotli` (inline): seq -> a brotli copy up to [`INLINE_MAX`].
+//! - `blobs`: seq, a native u64 (`INTEGER_KEY`) -> [`Record`]. Seqs only grow,
+//!   so new records are appended.
+//! - `ids`: sha256 -> seq (u64 LE). Whether a blob is here never reads its
+//!   record.
+//! - `owners`: pubkey -> `DUPFIXED` stamps, uploaded (u32 BE) then seq (48 bits
+//!   BE), so a pubkey's blobs sort oldest first: `/list` pages and counts per
+//!   pubkey come straight from the index.
+//! - `blob_owners`: seq (u64 BE) -> `DUPFIXED` pubkeys.
+//! - `reports`: sha256 then the report's event id -> its JSON.
+//! - `info`: `version` -> the layout's version.
+//! - `bodies`: seq -> the bytes of a blob up to [`INLINE_MAX`].
+//! - `brotli`: seq -> a brotli copy up to [`INLINE_MAX`].
 //! - `access` (stats): seq -> the day (u16 LE, since the epoch) it was last read.
 //!
 //! Reads go through a reset-and-renewed read transaction kept per thread
@@ -147,11 +148,11 @@ thread_local! {
 
 impl Store {
     pub fn open(dir: &Path) -> Result<Store> {
-        for sub in ["meta", "inline", "stats"] {
+        for sub in ["meta", "stats"] {
             std::fs::create_dir_all(dir.join(sub))
                 .with_context(|| format!("Could not create {}", dir.join(sub).display()))?;
         }
-        let mut env = Env::open(
+        let env = Env::open(
             &dir.join("meta"),
             lmdb::Sync::Durable,
             MAP_SIZE,
@@ -164,13 +165,6 @@ impl Store {
                 dir.join("meta").display()
             )
         })?;
-        let inline = env.attach(
-            &dir.join("inline"),
-            lmdb::Sync::Durable,
-            MAP_SIZE,
-            4,
-            MAX_READERS,
-        )?;
         let info = env.create_db("info", DbFlags::PLAIN)?;
         let store_env_tables = (
             env.create_db("blobs", DbFlags::INTEGER_KEY)?,
@@ -178,8 +172,8 @@ impl Store {
             env.create_db("owners", DbFlags::DUP_FIXED)?,
             env.create_db("blob_owners", DbFlags::DUP_FIXED)?,
             env.create_db("reports", DbFlags::PLAIN)?,
-            env.create_db_in(inline, "bodies", DbFlags::INTEGER_KEY)?,
-            env.create_db_in(inline, "brotli", DbFlags::INTEGER_KEY)?,
+            env.create_db("bodies", DbFlags::INTEGER_KEY)?,
+            env.create_db("brotli", DbFlags::INTEGER_KEY)?,
         );
         {
             let mut txn = env.write_txn()?;
@@ -212,7 +206,7 @@ impl Store {
         })
     }
 
-    /// Run `f` in a fresh snapshot of the durable environments, through this
+    /// Run `f` in a fresh snapshot of the durable environment, through this
     /// thread's renewable reader. `f` mustn't read the store again itself.
     pub fn read<R>(&'static self, f: impl FnOnce(&Txn<'_>) -> R) -> Result<R> {
         let key = self as *const Store as usize;
