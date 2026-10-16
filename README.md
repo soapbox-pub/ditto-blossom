@@ -83,6 +83,13 @@ It adds every blob not here yet, hard-linking files into place (so put
 gives existing ones any owners they're missing, so it can be run again just
 before switching over. Blobs with no type get one from their bytes. Small
 blobs are hash-checked as they're copied in; `--verify` checks every file.
+Files it can't read are skipped and counted.
+
+`import` and `remove` can run beside the running server. Run them as the
+server's user (`sudo -u ditto-blossom …`): files and directories they make
+belong to whoever runs them, and the server must be able to write there.
+
+`ditto-blossom remove SHA256...` takes blobs out entirely, whoever owns them.
 
 ## Developing
 
