@@ -26,6 +26,10 @@ pub struct Config {
     /// call before the send.
     #[serde(default = "default_open_files")]
     pub open_files: usize,
+    /// Threads making brotli copies in the background, at low priority.
+    /// Half the CPUs if unset; 0 makes none.
+    #[serde(default)]
+    pub compress_threads: Option<usize>,
     #[serde(default)]
     pub upload: Upload,
     #[serde(default)]

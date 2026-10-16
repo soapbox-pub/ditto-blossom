@@ -35,7 +35,8 @@ pub fn wanted(rec: &Record) -> bool {
 }
 
 impl Compressor {
-    /// Start `workers` threads, and queue every blob still to be tried.
+    /// Start `workers` threads, and queue every blob still to be tried. With
+    /// none, offers go nowhere and nothing is compressed.
     pub fn start(
         store: &'static Store,
         files: &'static Files,
@@ -43,8 +44,11 @@ impl Compressor {
         workers: usize,
     ) -> Compressor {
         let (tx, rx) = mpsc::sync_channel::<(u64, Hash)>(QUEUE);
+        if workers == 0 {
+            return Compressor { tx };
+        }
         let rx = std::sync::Arc::new(parking_lot::Mutex::new(rx));
-        for i in 0..workers.max(1) {
+        for i in 0..workers {
             let (rx, writer) = (rx.clone(), writer.clone());
             std::thread::Builder::new()
                 .name(format!("brotli-{i}"))

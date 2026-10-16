@@ -35,8 +35,9 @@ impl App {
         let files: &'static Files =
             Box::leak(Box::new(Files::open(&config.data, config.open_files)?));
         let writer = Writer::start(store, files);
-        let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
-        let compressor = Compressor::start(store, files, writer.clone(), (threads / 2).max(1));
+        let cpus = std::thread::available_parallelism().map_or(1, |n| n.get());
+        let workers = config.compress_threads.unwrap_or((cpus / 2).max(1));
+        let compressor = Compressor::start(store, files, writer.clone(), workers);
         let http = crate::mirror::client(config.mirror.allow_private);
         Ok(Box::leak(Box::new(App {
             auth: Verifier::new(config.domain()?),
