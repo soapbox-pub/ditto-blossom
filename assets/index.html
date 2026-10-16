@@ -1,32 +1,91 @@
-<!doctype html>
+<!DOCTYPE html>
 <html lang="en">
 <head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Blossom server</title>
-<style>
-  :root { color-scheme: light dark; font-family: system-ui, sans-serif; }
-  body { max-width: 40rem; margin: 4rem auto; padding: 0 1.25rem; line-height: 1.55; }
-  h1 { font-size: 1.6rem; margin-bottom: .25rem; }
-  .sub { opacity: .7; margin-top: 0; }
-  code { font-size: .92em; }
-  table { border-collapse: collapse; margin: 1rem 0; }
-  td { padding: .2rem 1rem .2rem 0; vertical-align: top; }
-  a { color: inherit; }
-</style>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Blossom Server</title>
+  <link rel="icon" href="/favicon.ico">
+  <link rel="apple-touch-icon" href="/icon.png">
+  <meta name="description" content="A Blossom server: blobs addressed by their SHA-256 hash, for Nostr clients.">
+  <meta property="og:type" content="website">
+  <meta property="og:title" content="Blossom Server">
+  <meta property="og:description" content="A Blossom server: blobs addressed by their SHA-256 hash, for Nostr clients.">
+  <meta property="og:image" content="{{public_url}}/icon.png">
+  <meta name="twitter:card" content="summary">
+  <style>
+    *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+    :root{--bg:#0a0a0c;--surface:#12121a;--border:#1e1e2e;--text:#e0e0e8;--text-dim:#7f7f96;--accent:#7c5cfc;--radius:16px}
+    html{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+      background:var(--bg);color:var(--text);line-height:1.6;-webkit-font-smoothing:antialiased}
+    body{min-height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:24px}
+    .card{width:100%;max-width:600px;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius)}
+    .card-body{padding:32px 24px 24px}
+    .icon{width:80px;height:80px;border-radius:20px;border:4px solid var(--border);object-fit:cover;
+      background:var(--border);box-shadow:0 4px 24px #0004;margin-bottom:16px;display:block}
+    .name{font-size:1.4rem;font-weight:700;letter-spacing:-0.02em}
+    .description{margin-top:8px;color:var(--text-dim);font-size:0.92rem;line-height:1.55}
+    .description a{color:var(--accent);text-decoration:none}
+    .description a:hover{text-decoration:underline}
+    .meta{margin-top:12px;font-size:0.82rem;color:var(--text-dim)}
+    .meta strong{color:var(--text);font-weight:600}
+    .url-wrap{padding:0 24px 24px}
+    .url-group{display:flex;align-items:center;background:var(--bg);border:1px solid var(--border);
+      border-radius:100px;overflow:hidden;transition:border-color .15s}
+    .url-group:hover{border-color:#2a2a40}
+    .url-group:focus-within{border-color:var(--accent);box-shadow:0 0 0 2px rgba(124,92,252,0.15)}
+    .url-input{flex:1;background:none;border:none;color:var(--text);font-size:0.88rem;
+      padding:12px 0 12px 20px;outline:none;font-family:inherit;min-width:0;letter-spacing:0.01em}
+    .url-input::selection{background:rgba(124,92,252,0.3)}
+    .copy-btn{display:flex;align-items:center;gap:6px;background:none;border:none;color:var(--text-dim);
+      cursor:pointer;padding:10px 16px 10px 12px;font-size:0.78rem;font-family:inherit;
+      border-radius:0 100px 100px 0;transition:color .15s,background .15s;white-space:nowrap;letter-spacing:0.02em}
+    .copy-btn:hover{color:var(--text);background:rgba(255,255,255,0.04)}
+    .copy-btn:active{background:rgba(255,255,255,0.07)}
+    .copy-btn svg{width:16px;height:16px;flex-shrink:0}
+    .endpoints{border-top:1px solid var(--border);padding:16px 24px 20px;list-style:none}
+    .endpoints li{display:flex;flex-wrap:wrap;align-items:baseline;gap:2px 12px;padding:6px 0;font-size:0.82rem;color:var(--text-dim)}
+    .endpoints code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:0.8rem;color:var(--text);min-width:21ch}
+    .endpoints .method{color:var(--accent);display:inline-block;width:7.5ch}
+    .footer{margin-top:24px;text-align:center;color:var(--text-dim);font-size:0.7rem}
+    .version{opacity:0.7}
+  </style>
 </head>
 <body>
-<h1>Blossom server</h1>
-<p class="sub">{{count}} blobs, served at <code>{{public_url}}</code></p>
-<p>This is a <a href="https://github.com/hzrd149/blossom">Blossom</a> server: it stores
-blobs addressed by their SHA-256 hash, for Nostr clients.</p>
-<table>
-  <tr><td><code>GET /&lt;sha256&gt;</code></td><td>Fetch a blob (BUD-01)</td></tr>
-  <tr><td><code>PUT /upload</code></td><td>Upload a blob, with a Nostr auth token (BUD-02)</td></tr>
-  <tr><td><code>PUT /mirror</code></td><td>Copy a blob from another server (BUD-04)</td></tr>
-  <tr><td><code>DELETE /&lt;sha256&gt;</code></td><td>Delete your blob (BUD-12)</td></tr>
-  <tr><td><code>PUT /report</code></td><td>Report a blob (BUD-09)</td></tr>
-</table>
-<p>Powered by ditto-blossom.</p>
+  <div class="card">
+    <div class="card-body">
+      <img class="icon" src="/icon.png" alt="">
+      <h1 class="name">Blossom Server</h1>
+      <p class="description">This is a <a href="https://github.com/hzrd149/blossom" target="_blank" rel="noopener">Blossom</a> server: it stores blobs addressed by their SHA-256 hash, for Nostr clients.</p>
+      <div class="meta"><strong>{{count}}</strong> blobs</div>
+    </div>
+    <div class="url-wrap">
+      <div class="url-group">
+        <input class="url-input" type="text" value="{{public_url}}" readonly>
+        <button class="copy-btn" type="button" onclick="copyUrl(this)" aria-label="Copy server URL">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+          <span class="label">Copy</span>
+        </button>
+      </div>
+    </div>
+    <ul class="endpoints">
+      <li><code><span class="method">GET</span>/&lt;sha256&gt;</code><span>Fetch a blob (BUD-01)</span></li>
+      <li><code><span class="method">PUT</span>/upload</code><span>Upload a blob, with a Nostr auth token (BUD-02)</span></li>
+      <li><code><span class="method">PUT</span>/mirror</code><span>Copy a blob from another server (BUD-04)</span></li>
+      <li><code><span class="method">DELETE</span>/&lt;sha256&gt;</code><span>Delete your blob (BUD-12)</span></li>
+      <li><code><span class="method">PUT</span>/report</code><span>Report a blob (BUD-09)</span></li>
+    </ul>
+  </div>
+  <div class="footer">Ditto Blossom <span class="version">v{{version}}</span></div>
+  <script>
+    function copyUrl(btn){
+      var input=btn.parentNode.querySelector('.url-input');
+      navigator.clipboard.writeText(input.value).then(function(){
+        var label=btn.querySelector('.label');
+        label.textContent='Copied!';
+        btn.style.color='var(--accent)';
+        setTimeout(function(){label.textContent='Copy';btn.style.color='';},1500);
+      });
+    }
+  </script>
 </body>
 </html>

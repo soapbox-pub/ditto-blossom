@@ -16,6 +16,8 @@ use crate::server::Body;
 use crate::upload;
 
 const LANDING: &str = include_str!("../assets/index.html");
+const FAVICON: &[u8] = include_bytes!("../assets/favicon.ico");
+const ICON: &[u8] = include_bytes!("../assets/icon.png");
 
 pub async fn handle(app: &'static App, req: Request<Incoming>, peer: SocketAddr) -> Response<Body> {
     let mut response = route(app, req, peer).await;
@@ -40,6 +42,8 @@ async fn route(app: &'static App, req: Request<Incoming>, peer: SocketAddr) -> R
     }
     match (method, path.as_str()) {
         (Method::GET, "/") => landing(app),
+        (Method::GET, "/favicon.ico") => asset("image/x-icon", FAVICON),
+        (Method::GET, "/icon.png") => asset("image/png", ICON),
         (Method::PUT, "/upload") => upload::upload(app, req, peer).await,
         (Method::HEAD, "/upload") => upload::head_upload(app, &req),
         (Method::PUT, "/mirror") => crate::mirror::mirror(app, req, peer).await,
@@ -95,7 +99,8 @@ fn landing(app: &'static App) -> Response<Body> {
     let count = app.store.count().unwrap_or(0);
     let page = LANDING
         .replace("{{public_url}}", &app.config.public_url)
-        .replace("{{count}}", &group_digits(count));
+        .replace("{{count}}", &group_digits(count))
+        .replace("{{version}}", env!("CARGO_PKG_VERSION"));
     let mut r = Response::new(Full::new(Bytes::from(page)));
     r.headers_mut().insert(
         header::CONTENT_TYPE,
@@ -104,6 +109,17 @@ fn landing(app: &'static App) -> Response<Body> {
     r.headers_mut().insert(
         header::CACHE_CONTROL,
         HeaderValue::from_static("public, max-age=60"),
+    );
+    r
+}
+
+fn asset(content_type: &'static str, bytes: &'static [u8]) -> Response<Body> {
+    let mut r = Response::new(Full::new(Bytes::from_static(bytes)));
+    r.headers_mut()
+        .insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
+    r.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("public, max-age=86400"),
     );
     r
 }
