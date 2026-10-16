@@ -29,6 +29,7 @@ struct Counts {
     present: u64,
     owners: u64,
     missing: u64,
+    unreadable: u64,
     corrupt: u64,
     sniffed: u64,
 }
@@ -100,7 +101,7 @@ pub fn run(config: &Config, sqlite: &Path, dir: &Path, copy: bool, verify: bool)
                 &mut counts,
             )?;
             batch.clear();
-            crate::info!("import_progress", "added": counts.added, "present": counts.present, "missing": counts.missing, "corrupt": counts.corrupt);
+            crate::info!("import_progress", "added": counts.added, "present": counts.present, "missing": counts.missing, "unreadable": counts.unreadable, "corrupt": counts.corrupt);
         }
         if row.is_none() {
             break;
@@ -113,7 +114,7 @@ pub fn run(config: &Config, sqlite: &Path, dir: &Path, copy: bool, verify: bool)
     crate::info!(
         "import_finished",
         "added": counts.added, "inline": counts.inline, "present": counts.present, "owners_added": counts.owners,
-        "missing": counts.missing, "corrupt": counts.corrupt, "sniffed": counts.sniffed,
+        "missing": counts.missing, "unreadable": counts.unreadable, "corrupt": counts.corrupt, "sniffed": counts.sniffed,
         "seconds": started.elapsed().as_secs()
     );
     Ok(())
@@ -148,6 +149,13 @@ fn write_batch(
             counts.missing += 1;
             continue;
         };
+        // A file this user may not read is that file's problem, not the
+        // import's: say so and go on.
+        if let Err(e) = blobs::open_noatime(path) {
+            crate::warn!("import_unreadable", "path": path.display().to_string(), "error": e.to_string());
+            counts.unreadable += 1;
+            continue;
+        }
         let size = std::fs::metadata(path)?.len();
         let small = size as usize <= INLINE_MAX;
         let body = if small {
