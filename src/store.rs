@@ -21,7 +21,7 @@
 //! - `access` (stats): seq -> the day (u16 LE, since the epoch) it was last read.
 //!
 //! Reads go through a reset-and-renewed read transaction kept per thread
-//! and store ([`Store::read`]), which spike 2b measured at 2.3x a fresh
+//! and store ([`Store::read`]), measured at 2.3x a fresh
 //! transaction per lookup on eight threads.
 
 use std::cell::RefCell;
@@ -34,7 +34,7 @@ use crate::hash::Hash;
 use crate::lmdb::{self, Db, DbFlags, Env, RwTxn, Txn};
 
 /// Blobs up to this size live inline in LMDB rather than as files: reading
-/// one costs 0.53 µs against 2.2 µs to open, read and close a file (spike 2).
+/// one costs 0.53 µs against 2.2 µs to open, read and close a file.
 pub const INLINE_MAX: usize = 16 << 10;
 /// The maps are only address space; files grow as they fill.
 const MAP_SIZE: usize = 1 << 40;
@@ -68,7 +68,7 @@ const FIXED: usize = 60;
 impl Record {
     /// `[version, flags, codec, type length] hash size uploaded br_size type`.
     /// The codec byte is 0, raw bytes; it's there so a recompressed tier can
-    /// be added without rewriting records (spike 5).
+    /// be added without rewriting records.
     pub fn encode(&self) -> Vec<u8> {
         let mime = self.mime.as_deref().unwrap_or("").as_bytes();
         let mut v = Vec::with_capacity(FIXED + mime.len());

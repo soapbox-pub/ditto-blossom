@@ -17,8 +17,6 @@ On the same four cores, with production's data, against blossom-server
 | uploads, 1 MB, 64 at once | 222 MB/s | 101 MB/s (and 503s) | 2.2x |
 
 Every upload is on disk before it's acknowledged; blossom-server's aren't.
-How each choice was made, with the measurements, is in [docs/plan.md](docs/plan.md)
-and [spikes/](spikes/).
 
 ## What it serves
 
@@ -55,7 +53,7 @@ not brotli, like Tor Browser on onion services, get gzip made on the spot.
 It wants a Linux filesystem with a page cache that sendfile can hand to
 sockets: **ext4 or xfs**. On ZFS, put the data on an ext4-formatted zvol
 rather than a dataset; serving large blobs from a dataset costs about three
-times the CPU (spike 7). If you delete blobs, run `fstrim` on a timer so a
+times the CPU. If you delete blobs, run `fstrim` on a timer so a
 zvol gives freed space back.
 
 ```sh

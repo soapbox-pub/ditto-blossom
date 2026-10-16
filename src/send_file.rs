@@ -21,7 +21,7 @@ use parking_lot::RwLock;
 
 /// Size from which a mapping is registered, and so sent with sendfile(2).
 /// On ext4, sendfile costs 0.6x the CPU of writing from the mapping at
-/// 16 KiB and 0.3x from 256 KiB (spike 7); blobs below it are inline anyway.
+/// 16 KiB and 0.3x from 256 KiB; blobs below it are inline anyway.
 pub const MIN: usize = crate::store::INLINE_MAX;
 
 /// Every registered mapping, by the address it starts at: its length, and

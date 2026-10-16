@@ -3,7 +3,7 @@
 //!
 //! A blob is served as one of three representations, each with its own
 //! entity tag: its own bytes; its brotli copy, to clients that take brotli;
-//! or gzip made on the spot (level 1, 140 MB/s a core, spike 4) for clients
+//! or gzip made on the spot (level 1, 140 MB/s a core) for clients
 //! that take gzip but not brotli, like Tor Browser on onion services. A
 //! range is always of its own bytes.
 

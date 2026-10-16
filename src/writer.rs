@@ -3,7 +3,7 @@
 //! Requests send it jobs and await its replies. It takes whatever is queued
 //! and does it all in one transaction, one durable commit: a commit costs a
 //! couple of flushes whatever it holds, so under load uploads share them
-//! (spike 2b: 64 a commit is 24x the uploads a second). New files are put
+//! (64 a commit is 24x the uploads a second). New files are put
 //! in place and flushed, the batch's together with one `syncfs`, before the
 //! commit that makes them visible: a blob the database knows of is always
 //! whole on disk.

@@ -414,7 +414,7 @@ impl Env {
     /// A read transaction kept between uses with `mdb_txn_reset`, so
     /// beginning one again (`mdb_txn_renew`) keeps its reader slots rather
     /// than taking the lock that hands slots out: with it, lookups scale
-    /// with threads (spike 2b measured 2.3x on eight).
+    /// with threads (2.3x on eight).
     pub fn reader(&self) -> Result<Reader<'_>> {
         let txn = self.begin(ffi::MDB_RDONLY)?;
         for &ptr in txn.ptrs.iter().filter(|p| !p.is_null()) {

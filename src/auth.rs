@@ -2,7 +2,7 @@
 //! `Authorization: Nostr …` header.
 //!
 //! Every check that costs nothing comes before the signature, which costs
-//! 36 µs of the 44 µs a header takes (spike 6). A token whose id has been
+//! 36 µs of the 44 µs a header takes. A token whose id has been
 //! verified already skips the signature: the id commits to every field, and
 //! clients often send one token for `HEAD /upload` and then `PUT /upload`.
 

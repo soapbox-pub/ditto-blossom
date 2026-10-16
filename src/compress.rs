@@ -1,6 +1,6 @@
 //! Brotli copies of compressible blobs, made in the background at low CPU
 //! priority, never on the upload's path: quality 11 runs at 0.4-1 MB/s
-//! (spike 4). A copy is kept only if it saves at least 5%; either way the
+//! on production's CPU. A copy is kept only if it saves at least 5%; either way the
 //! blob is marked as tried, so it isn't tried again.
 //!
 //! New blobs are offered as they're stored. At startup, every compressible
