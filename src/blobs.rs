@@ -25,13 +25,16 @@ pub struct Files {
 }
 
 impl Files {
-    /// Open the store under `data`, clearing what an earlier run left in
-    /// `tmp/`.
-    pub fn open(data: &Path, open_files: usize) -> io::Result<Files> {
+    /// Open the store under `data`. Only the server should `clear` what an
+    /// earlier run left in `tmp/`: anything else may be running beside it,
+    /// mid-upload.
+    pub fn open(data: &Path, open_files: usize, clear: bool) -> io::Result<Files> {
         let root = data.join("blobs");
         let tmp = data.join("tmp");
         std::fs::create_dir_all(&root)?;
-        let _ = std::fs::remove_dir_all(&tmp);
+        if clear {
+            let _ = std::fs::remove_dir_all(&tmp);
+        }
         std::fs::create_dir_all(&tmp)?;
         let capacity = std::num::NonZeroUsize::new(open_files.max(1)).expect("non-zero");
         Ok(Files {
@@ -208,7 +211,7 @@ mod tests {
     #[test]
     fn places_temp_files_and_maps_them() {
         let dir = tempfile::tempdir().unwrap();
-        let files = Files::open(dir.path(), 4).unwrap();
+        let files = Files::open(dir.path(), 4, true).unwrap();
         let data = vec![5u8; 100_000];
         let hash = Hash::of(&data);
         let mut tmp = files.temp().unwrap();
@@ -229,7 +232,7 @@ mod tests {
     #[test]
     fn abandoned_temp_files_vanish() {
         let dir = tempfile::tempdir().unwrap();
-        let files = Files::open(dir.path(), 4).unwrap();
+        let files = Files::open(dir.path(), 4, true).unwrap();
         let tmp = files.temp().unwrap();
         let path = tmp.path().to_path_buf();
         assert!(path.exists());

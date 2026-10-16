@@ -37,8 +37,11 @@ impl App {
     pub fn open(config: Config) -> Result<&'static App> {
         crate::install_crypto();
         let store: &'static Store = Box::leak(Box::new(Store::open(&config.data)?));
-        let files: &'static Files =
-            Box::leak(Box::new(Files::open(&config.data, config.open_files)?));
+        let files: &'static Files = Box::leak(Box::new(Files::open(
+            &config.data,
+            config.open_files,
+            true,
+        )?));
         let writer = Writer::start(store, files);
         let cpus = std::thread::available_parallelism().map_or(1, |n| n.get());
         let workers = config.compress_threads.unwrap_or((cpus / 2).max(1));

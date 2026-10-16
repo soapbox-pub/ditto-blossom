@@ -37,7 +37,7 @@ struct Counts {
 pub fn run(config: &Config, sqlite: &Path, dir: &Path, copy: bool, verify: bool) -> Result<()> {
     let started = Instant::now();
     let store: &'static Store = Box::leak(Box::new(Store::open(&config.data)?));
-    let files = Files::open(&config.data, 1)?;
+    let files = Files::open(&config.data, 1, false)?;
     let db = Connection::open_with_flags(sqlite, OpenFlags::SQLITE_OPEN_READ_ONLY)
         .with_context(|| format!("Could not open {}", sqlite.display()))?;
 
@@ -224,4 +224,27 @@ fn hash_file(path: &Path) -> Result<Hash> {
         }
         h.update(&buf[..n]);
     }
+}
+
+/// `ditto-blossom remove`: take blobs out entirely, whoever owns them, as a
+/// moderator would, or to carry deletes over from another server. Safe beside
+/// a running server: once the record is gone it answers 404.
+pub fn remove(config: &Config, hashes: &[Hash]) -> Result<()> {
+    let store: &'static Store = Box::leak(Box::new(Store::open(&config.data)?));
+    let files = Files::open(&config.data, 1, false)?;
+    for hash in hashes {
+        let mut txn = store.write_txn()?;
+        let Some(seq) = store.seq_of(&txn, hash)? else {
+            crate::info!("remove_absent", "blob": hash.hex());
+            continue;
+        };
+        let rec = store
+            .record(&txn, seq)?
+            .context("a blob without its record")?;
+        store.remove(&mut txn, seq, &rec)?;
+        txn.commit()?;
+        files.remove(seq, hash)?;
+        crate::info!("removed", "blob": hash.hex(), "size": rec.size);
+    }
+    Ok(())
 }

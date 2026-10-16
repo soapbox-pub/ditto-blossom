@@ -37,12 +37,14 @@ const USAGE: &str = "\
 usage:
   ditto-blossom [serve] [-c CONFIG]
   ditto-blossom import [-c CONFIG] --sqlite DB --blobs DIR [--copy] [--verify]
+  ditto-blossom remove [-c CONFIG] SHA256...
   ditto-blossom --version
 
 CONFIG defaults to ./ditto-blossom.toml.
 import takes over a blossom-server's blobs: its SQLite database and its blob
 directory. Files are hard-linked into place unless --copy; --verify hashes
-every file, not only the small ones.";
+every file, not only the small ones.
+remove takes blobs out entirely, whoever owns them.";
 
 /// How often reads are folded into the access table.
 const ACCESS_FLUSH: Duration = Duration::from_secs(300);
@@ -57,7 +59,7 @@ fn main() {
 fn run() -> Result<()> {
     let mut args = std::env::args().skip(1).peekable();
     let command = match args.peek().map(String::as_str) {
-        Some("serve" | "import") => args.next().expect("peeked"),
+        Some("serve" | "import" | "remove") => args.next().expect("peeked"),
         Some("--version" | "-V") => {
             println!("ditto-blossom {}", env!("CARGO_PKG_VERSION"));
             return Ok(());
@@ -70,6 +72,7 @@ fn run() -> Result<()> {
     };
     let mut config_path = PathBuf::from("ditto-blossom.toml");
     let (mut sqlite, mut dir, mut copy, mut verify) = (None, None, false, false);
+    let mut hashes = Vec::new();
     while let Some(arg) = args.next() {
         let mut value = || args.next().with_context(|| format!("{arg} needs a value"));
         match arg.as_str() {
@@ -78,11 +81,16 @@ fn run() -> Result<()> {
             "--blobs" if command == "import" => dir = Some(PathBuf::from(value()?)),
             "--copy" if command == "import" => copy = true,
             "--verify" if command == "import" => verify = true,
+            hex if command == "remove" && !hex.starts_with('-') => hashes.push(
+                hash::Hash::parse(hex.as_bytes())
+                    .with_context(|| format!("{hex} isn't a SHA-256 hash"))?,
+            ),
             _ => bail!("unexpected argument {arg}\n\n{USAGE}"),
         }
     }
     let config = Config::load(&config_path)?;
     match command.as_str() {
+        "remove" => import::remove(&config, &hashes),
         "import" => import::run(
             &config,
             &sqlite.context("import needs --sqlite")?,
