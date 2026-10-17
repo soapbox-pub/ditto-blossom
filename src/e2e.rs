@@ -194,10 +194,14 @@ async fn head_conditional_ranges_and_errors() {
 
     let r = c.get(&s.url).send().await.unwrap();
     assert_eq!(r.status(), StatusCode::OK);
-    assert!(r.text().await.unwrap().contains("<strong>1</strong> blobs"));
+    let page = r.text().await.unwrap();
+    assert!(page.contains("<strong>1</strong> blobs"));
+    assert!(page.contains(&format!(r#"og:image" content="{}/banner.jpg""#, s.url)));
 
     let r = c.get(format!("{}/icon.png", s.url)).send().await.unwrap();
     assert_eq!(r.headers()["content-type"], "image/png");
+    let r = c.get(format!("{}/banner.jpg", s.url)).send().await.unwrap();
+    assert_eq!(r.headers()["content-type"], "image/jpeg");
 }
 
 mod writes;

@@ -18,6 +18,7 @@ use crate::upload;
 const LANDING: &str = include_str!("../assets/index.html");
 const FAVICON: &[u8] = include_bytes!("../assets/favicon.ico");
 const ICON: &[u8] = include_bytes!("../assets/icon.png");
+const BANNER: &[u8] = include_bytes!("../assets/banner.jpg");
 
 pub async fn handle(app: &'static App, req: Request<Incoming>, peer: SocketAddr) -> Response<Body> {
     let mut response = route(app, req, peer).await;
@@ -44,6 +45,7 @@ async fn route(app: &'static App, req: Request<Incoming>, peer: SocketAddr) -> R
         (Method::GET, "/") => landing(app),
         (Method::GET, "/favicon.ico") => asset("image/x-icon", FAVICON),
         (Method::GET, "/icon.png") => asset("image/png", ICON),
+        (Method::GET, "/banner.jpg") => asset("image/jpeg", BANNER),
         (Method::PUT, "/upload") => upload::upload(app, req, peer).await,
         (Method::HEAD, "/upload") => upload::head_upload(app, &req),
         (Method::PUT, "/mirror") => crate::mirror::mirror(app, req, peer).await,

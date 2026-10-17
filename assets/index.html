@@ -8,10 +8,19 @@
   <link rel="apple-touch-icon" href="/icon.png">
   <meta name="description" content="A Blossom server: blobs addressed by their SHA-256 hash, for Nostr clients.">
   <meta property="og:type" content="website">
+  <meta property="og:site_name" content="Ditto">
   <meta property="og:title" content="Blossom Server">
   <meta property="og:description" content="A Blossom server: blobs addressed by their SHA-256 hash, for Nostr clients.">
-  <meta property="og:image" content="{{public_url}}/icon.png">
-  <meta name="twitter:card" content="summary">
+  <meta property="og:url" content="{{public_url}}/">
+  <meta property="og:image" content="{{public_url}}/banner.jpg">
+  <meta property="og:image:type" content="image/jpeg">
+  <meta property="og:image:width" content="1536">
+  <meta property="og:image:height" content="1024">
+  <meta property="og:image:alt" content="Ditto Blossom Server">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="Blossom Server">
+  <meta name="twitter:description" content="A Blossom server: blobs addressed by their SHA-256 hash, for Nostr clients.">
+  <meta name="twitter:image" content="{{public_url}}/banner.jpg">
   <style>
     *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
     :root{--bg:#0a0a0c;--surface:#12121a;--border:#1e1e2e;--text:#e0e0e8;--text-dim:#7f7f96;--accent:#7c5cfc;--radius:16px}
@@ -19,9 +28,12 @@
       background:var(--bg);color:var(--text);line-height:1.6;-webkit-font-smoothing:antialiased}
     body{min-height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:24px}
     .card{width:100%;max-width:600px;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius)}
-    .card-body{padding:32px 24px 24px}
-    .icon{width:80px;height:80px;border-radius:20px;border:4px solid var(--border);object-fit:cover;
-      background:var(--border);box-shadow:0 4px 24px #0004;margin-bottom:16px;display:block}
+    .banner-wrap{position:relative;aspect-ratio:21/9;overflow:hidden;border-radius:var(--radius) var(--radius) 0 0;background:var(--border)}
+    .banner-img{width:100%;height:100%;object-fit:cover;display:block}
+    .icon-row{position:relative;height:0}
+    .icon{position:absolute;bottom:0;left:24px;transform:translateY(50%);width:80px;height:80px;border-radius:20px;
+      border:4px solid var(--surface);object-fit:cover;background:var(--border);box-shadow:0 4px 24px #0004}
+    .card-body{padding:56px 24px 24px}
     .name{font-size:1.4rem;font-weight:700;letter-spacing:-0.02em}
     .description{margin-top:8px;color:var(--text-dim);font-size:0.92rem;line-height:1.55}
     .description a{color:var(--accent);text-decoration:none}
@@ -52,8 +64,9 @@
 </head>
 <body>
   <div class="card">
+    <div class="banner-wrap"><img class="banner-img" src="/banner.jpg" alt=""></div>
+    <div class="icon-row"><img class="icon" src="/icon.png" alt=""></div>
     <div class="card-body">
-      <img class="icon" src="/icon.png" alt="">
       <h1 class="name">Blossom Server</h1>
       <p class="description">This is a <a href="https://github.com/hzrd149/blossom" target="_blank" rel="noopener">Blossom</a> server: it stores blobs addressed by their SHA-256 hash, for Nostr clients.</p>
       <div class="meta"><strong>{{count}}</strong> blobs</div>
