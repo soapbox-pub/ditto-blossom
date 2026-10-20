@@ -4,24 +4,39 @@
 //! gets in once the ban is committed.
 
 use std::collections::BTreeMap;
+use std::io::Read;
+use std::path::Path;
 
-use anyhow::Result;
+use anyhow::{Context, Result, bail};
 
-use crate::blobs::Files;
+use crate::blobs::{self, Files};
 use crate::config::Config;
+use crate::hash::{Hash, Hasher};
 use crate::store::{Ban, Banned, Record, Store};
 use crate::upload::now;
 
 /// Ban each target and take out what it names: a blob, or every blob an
 /// uploader owns, whoever else owns it. A banned uploader's blobs are
-/// banned too, so another key can't put them back.
-pub fn ban(config: &Config, targets: &[Banned], reason: &str) -> Result<()> {
+/// banned too, so another key can't put them back. With `preserve`, each
+/// blob is copied there, and its copy checked, before anything is removed.
+pub fn ban(
+    config: &Config,
+    targets: &[Banned],
+    reason: &str,
+    preserve: Option<&Path>,
+) -> Result<()> {
     let store = Store::open(&config.data)?;
     let files = Files::open(&config.data, 1, false)?;
-    ban_in(&store, &files, targets, reason)
+    ban_in(&store, &files, targets, reason, preserve)
 }
 
-pub fn ban_in(store: &Store, files: &Files, targets: &[Banned], reason: &str) -> Result<()> {
+pub fn ban_in(
+    store: &Store,
+    files: &Files,
+    targets: &[Banned],
+    reason: &str,
+    preserve: Option<&Path>,
+) -> Result<()> {
     let at = now();
     let entry = |target| Ban {
         target,
@@ -44,6 +59,12 @@ pub fn ban_in(store: &Store, files: &Files, targets: &[Banned], reason: &str) ->
         }
     }
     for (seq, rec) in &doomed {
+        // Within the transaction, so nothing is removed that wasn't copied.
+        if let Some(dir) = preserve {
+            let body = store.body(&txn, *seq)?;
+            keep(files, dir, rec, body)
+                .with_context(|| format!("Could not preserve {}", rec.hash.hex()))?;
+        }
         store.ban(&mut txn, &entry(Banned::Blob(rec.hash)))?;
         store.remove(&mut txn, *seq, rec)?;
     }
@@ -52,6 +73,36 @@ pub fn ban_in(store: &Store, files: &Files, targets: &[Banned], reason: &str) ->
         files.remove(seq, &rec.hash)?;
         crate::info!("removed", "blob": rec.hash.hex(), "size": rec.size);
     }
+    Ok(())
+}
+
+/// Copy a blob to `dir/<sha256>`, durably, and check the copy's hash.
+fn keep(files: &Files, dir: &Path, rec: &Record, body: Option<Vec<u8>>) -> Result<()> {
+    let to = dir.join(rec.hash.hex());
+    match body {
+        Some(b) => std::fs::write(&to, b)?,
+        None => {
+            std::io::copy(
+                &mut blobs::open_noatime(&files.path(&rec.hash, false))?,
+                &mut std::fs::File::create(&to)?,
+            )?;
+        }
+    }
+    std::fs::File::open(&to)?.sync_all()?;
+    let mut f = std::fs::File::open(&to)?;
+    let (mut h, mut buf) = (Hasher::new(), vec![0; 1 << 20]);
+    loop {
+        let n = f.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        h.update(&buf[..n]);
+    }
+    let got: Hash = h.finish();
+    if got != rec.hash {
+        bail!("its copy hashes to {}", got.hex());
+    }
+    crate::info!("preserved", "blob": rec.hash.hex(), "size": rec.size, "to": to.display().to_string());
     Ok(())
 }
 

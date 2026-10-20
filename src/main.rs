@@ -39,7 +39,7 @@ usage:
   ditto-blossom [serve] [-c CONFIG]
   ditto-blossom import [-c CONFIG] --sqlite DB --blobs DIR [--copy] [--verify]
   ditto-blossom remove [-c CONFIG] SHA256...
-  ditto-blossom ban [-c CONFIG] [--reason TEXT] [--pubkey HEX]... [SHA256]...
+  ditto-blossom ban [-c CONFIG] [--reason TEXT] [--preserve DIR] [--pubkey HEX]... [SHA256]...
   ditto-blossom unban [-c CONFIG] [--pubkey HEX]... [SHA256]...
   ditto-blossom bans [-c CONFIG]
   ditto-blossom --version
@@ -51,7 +51,8 @@ every file, not only the small ones.
 remove takes blobs out entirely, whoever owns them.
 ban does that and keeps them out: banned blobs aren't stored again, by
 anyone, and banned pubkeys can't upload or mirror. A pubkey's ban takes out
-and bans every blob it owns. unban lifts bans; bans lists them.";
+and bans every blob it owns; --preserve copies each blob it removes to DIR
+first. unban lifts bans; bans lists them.";
 
 /// How often reads are folded into the access table.
 const ACCESS_FLUSH: Duration = Duration::from_secs(300);
@@ -82,7 +83,7 @@ fn run() -> Result<()> {
     let mut config_path = PathBuf::from("ditto-blossom.toml");
     let (mut sqlite, mut dir, mut copy, mut verify) = (None, None, false, false);
     let mut hashes = Vec::new();
-    let (mut pubkeys, mut reason) = (Vec::new(), String::new());
+    let (mut pubkeys, mut reason, mut preserve) = (Vec::new(), String::new(), None);
     let names_blobs = matches!(command.as_str(), "remove" | "ban" | "unban");
     let targeted = matches!(command.as_str(), "ban" | "unban");
     while let Some(arg) = args.next() {
@@ -94,6 +95,7 @@ fn run() -> Result<()> {
             "--copy" if command == "import" => copy = true,
             "--verify" if command == "import" => verify = true,
             "--reason" if command == "ban" => reason = value()?,
+            "--preserve" if command == "ban" => preserve = Some(PathBuf::from(value()?)),
             "--pubkey" if targeted => {
                 let hex = value()?;
                 pubkeys.push(
@@ -121,7 +123,7 @@ fn run() -> Result<()> {
     let config = Config::load(&config_path)?;
     match command.as_str() {
         "remove" => import::remove(&config, &hashes),
-        "ban" => moderate::ban(&config, &targets, &reason),
+        "ban" => moderate::ban(&config, &targets, &reason, preserve.as_deref()),
         "unban" => moderate::unban(&config, &targets),
         "bans" => moderate::list(&config),
         "import" => import::run(

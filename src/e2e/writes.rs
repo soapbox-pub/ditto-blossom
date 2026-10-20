@@ -371,13 +371,20 @@ async fn bans_keep_blobs_and_uploaders_out() {
         StatusCode::CREATED
     );
 
+    let kept_copies = tempfile::tempdir().unwrap();
     crate::moderate::ban_in(
         s.app.store,
         s.app.files,
         &[Banned::Pubkey(pk(&bad))],
         "csam",
+        Some(kept_copies.path()),
     )
     .unwrap();
+    // Preserved first, inline and file alike.
+    for data in [&small, &large] {
+        let copy = std::fs::read(kept_copies.path().join(Hash::of(data).hex())).unwrap();
+        assert_eq!(&copy, data);
+    }
 
     // Its blobs are gone, files and all, and banned; others' aren't.
     for data in [&small, &large] {

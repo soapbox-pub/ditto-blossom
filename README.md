@@ -105,6 +105,10 @@ committed nothing it names gets in; uploads and `HEAD /upload` are refused
 with 403 before their bodies when the blob or the uploader is known up
 front.
 
+`--preserve DIR` copies each blob `ban` is about to remove into `DIR`, and
+checks the copy's hash, in the same transaction: if a copy fails, nothing is
+removed. Use it when what's removed must be kept, as for a CSAM report.
+
 `ditto-blossom unban` lifts bans (a pubkey's blobs stay banned), and
 `ditto-blossom bans` lists them, a line each: kind, hex, when, reason.
 

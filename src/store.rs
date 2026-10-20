@@ -569,6 +569,13 @@ impl Store {
         }
     }
 
+    /// The bytes of an inline blob.
+    pub fn body(&self, txn: &Txn<'_>, seq: u64) -> Result<Option<Vec<u8>>> {
+        Ok(txn
+            .get(self.bodies, &seq.to_ne_bytes())?
+            .map(<[u8]>::to_vec))
+    }
+
     /// The seqs of a pubkey's blobs.
     pub fn owned(&self, txn: &Txn<'_>, pubkey: &[u8; 32]) -> Result<Vec<u64>> {
         let mut cur = txn.cursor(self.owners)?;
