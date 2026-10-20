@@ -19,7 +19,22 @@ use crate::ingest;
 use crate::routes::{blob_url, client_ip};
 use crate::server::Body;
 use crate::store::Record;
-use crate::writer::Deleted;
+use crate::writer::{Deleted, Refused};
+
+const BANNED: &str = "This blob, or its uploader, is banned here";
+
+/// A 403 if the blob or the uploader is banned. A failed read lets the
+/// request on; the writer checks again before anything is kept.
+pub fn refuse_banned(
+    app: &'static App,
+    hash: Option<&Hash>,
+    token: Option<&Token>,
+) -> Option<Response<Body>> {
+    app.store
+        .is_banned(hash, token.map(|t| &t.pubkey))
+        .unwrap_or(false)
+        .then(|| error(StatusCode::FORBIDDEN, BANNED))
+}
 
 pub fn now() -> u64 {
     SystemTime::now()
@@ -92,6 +107,9 @@ pub async fn upload(app: &'static App, req: Request<Incoming>, peer: SocketAddr)
         && !t.allows(c)
     {
         return error(StatusCode::FORBIDDEN, "The auth token isn't for this blob");
+    }
+    if let Some(r) = refuse_banned(app, claimed.as_ref(), token.as_ref()) {
+        return r;
     }
     if !app.upload_limit.allow(ip) {
         return error(
@@ -168,6 +186,10 @@ pub async fn store(
             };
             http::json(status, &descriptor(app, &stored.record))
         }
+        Err(e) if e.downcast_ref::<Refused>().is_some() => {
+            crate::info!("refused_banned", "via": how, "blob": hash.hex(), "owner": owner.map(hex::encode));
+            error(StatusCode::FORBIDDEN, BANNED)
+        }
         Err(e) => {
             crate::error!("store_failed", "blob": hash.hex(), "error": format!("{e:#}"));
             error(
@@ -224,6 +246,9 @@ pub fn head_upload(app: &'static App, req: &Request<Incoming>) -> Response<Body>
         && !t.allows(c)
     {
         return error(StatusCode::FORBIDDEN, "The auth token isn't for this blob");
+    }
+    if let Some(r) = refuse_banned(app, claimed.as_ref(), token.as_ref()) {
+        return r;
     }
     http::empty(StatusCode::OK)
 }

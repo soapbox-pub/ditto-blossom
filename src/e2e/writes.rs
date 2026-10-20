@@ -342,3 +342,114 @@ async fn mirrors_and_limits() {
         StatusCode::TOO_MANY_REQUESTS
     );
 }
+
+#[tokio::test]
+async fn bans_keep_blobs_and_uploaders_out() {
+    use crate::store::Banned;
+
+    let s = start("[mirror]\nallow_private = true\n").await;
+    let c = client();
+    let (bad, good) = (keypair(), keypair());
+    let pk = |kp: &secp256k1::Keypair| kp.x_only_public_key().0.to_byte_array();
+    let upload = |kp: &secp256k1::Keypair, data: &[u8]| {
+        c.put(format!("{}/upload", s.url))
+            .header("authorization", auth(kp, "upload", &[Hash::of(data)]))
+            .body(data.to_vec())
+    };
+    let get = |h: Hash| c.get(format!("{}/{}", s.url, h.hex())).send();
+    let small = b"banned small blob".to_vec();
+    let large: Vec<u8> = (0..300_000u32).map(|i| (i * 13 % 256) as u8).collect();
+    let kept = b"someone else's blob".to_vec();
+    for data in [&small, &large] {
+        assert_eq!(
+            upload(&bad, data).send().await.unwrap().status(),
+            StatusCode::CREATED
+        );
+    }
+    assert_eq!(
+        upload(&good, &kept).send().await.unwrap().status(),
+        StatusCode::CREATED
+    );
+
+    crate::moderate::ban_in(
+        s.app.store,
+        s.app.files,
+        &[Banned::Pubkey(pk(&bad))],
+        "csam",
+    )
+    .unwrap();
+
+    // Its blobs are gone, files and all, and banned; others' aren't.
+    for data in [&small, &large] {
+        assert_eq!(
+            get(Hash::of(data)).await.unwrap().status(),
+            StatusCode::NOT_FOUND
+        );
+    }
+    assert!(!s.app.files.path(&Hash::of(&large), false).exists());
+    assert_eq!(get(Hash::of(&kept)).await.unwrap().status(), StatusCode::OK);
+    assert_eq!(s.app.store.bans().unwrap().len(), 3);
+
+    // The banned key can't upload anything, even new bytes.
+    let r = upload(&bad, b"anything new").send().await.unwrap();
+    assert_eq!(r.status(), StatusCode::FORBIDDEN);
+    assert_eq!(
+        r.headers()["x-reason"],
+        "This blob, or its uploader, is banned here"
+    );
+
+    // Another key can't put its blobs back: refused before the body with
+    // X-SHA-256, by the writer without it, and at the BUD-06 preflight.
+    for data in [&small, &large] {
+        let h = Hash::of(data);
+        let r = upload(&good, data)
+            .header("x-sha-256", h.hex())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::FORBIDDEN);
+        let r = upload(&good, data).send().await.unwrap();
+        assert_eq!(r.status(), StatusCode::FORBIDDEN);
+        let r = c
+            .head(format!("{}/upload", s.url))
+            .header("authorization", auth(&good, "upload", &[h]))
+            .header("x-sha-256", h.hex())
+            .header("x-content-length", data.len().to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::FORBIDDEN);
+        assert_eq!(get(h).await.unwrap().status(), StatusCode::NOT_FOUND);
+    }
+
+    // Nor mirror them in from elsewhere.
+    let origin = start("").await;
+    let h = put(origin.app, &large, None);
+    let body = serde_json::json!({ "url": format!("{}/{}", origin.url, h.hex()) }).to_string();
+    let mirror = |kp: &secp256k1::Keypair, x: Hash| {
+        c.put(format!("{}/mirror", s.url))
+            .header("authorization", auth(kp, "upload", &[x]))
+            .body(body.clone())
+            .send()
+    };
+    assert_eq!(
+        mirror(&good, h).await.unwrap().status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        mirror(&bad, Hash::of(&kept)).await.unwrap().status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(get(h).await.unwrap().status(), StatusCode::NOT_FOUND);
+
+    // Lifting the key's ban lets it upload again; its old blobs stay banned.
+    crate::moderate::unban_in(s.app.store, &[Banned::Pubkey(pk(&bad))]).unwrap();
+    assert_eq!(
+        upload(&bad, b"anything new").send().await.unwrap().status(),
+        StatusCode::CREATED
+    );
+    assert_eq!(
+        upload(&bad, &small).send().await.unwrap().status(),
+        StatusCode::FORBIDDEN
+    );
+}

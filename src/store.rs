@@ -15,6 +15,8 @@
 //!   pubkey come straight from the index.
 //! - `blob_owners`: seq (u64 BE) -> `DUPFIXED` pubkeys.
 //! - `reports`: sha256 then the report's event id -> its JSON.
+//! - `banned_blobs`: sha256 -> [`Ban`]: never stored again, whoever sends it.
+//! - `banned_pubkeys`: pubkey -> [`Ban`]: owns nothing new.
 //! - `info`: `version` -> the layout's version.
 //! - `bodies`: seq -> the bytes of a blob up to [`INLINE_MAX`].
 //! - `brotli`: seq -> a brotli copy up to [`INLINE_MAX`].
@@ -118,6 +120,38 @@ fn stamp_parts(s: &[u8]) -> (u64, u64) {
     (uploaded, u64::from_be_bytes(seq))
 }
 
+/// What's banned: a blob, by its hash, or an uploader.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Banned {
+    Blob(Hash),
+    Pubkey([u8; 32]),
+}
+
+/// A ban as kept: `banned_at (u64 LE) reason`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Ban {
+    pub target: Banned,
+    /// Unix seconds.
+    pub at: u64,
+    pub reason: String,
+}
+
+impl Ban {
+    fn encode(&self) -> Vec<u8> {
+        let mut v = self.at.to_le_bytes().to_vec();
+        v.extend_from_slice(self.reason.as_bytes());
+        v
+    }
+
+    fn decode(target: Banned, v: &[u8]) -> Option<Ban> {
+        Some(Ban {
+            target,
+            at: u64::from_le_bytes(v.get(..8)?.try_into().ok()?),
+            reason: String::from_utf8_lossy(&v[8..]).into_owned(),
+        })
+    }
+}
+
 /// A blob as a read finds it.
 pub struct Found {
     pub seq: u64,
@@ -136,6 +170,8 @@ pub struct Store {
     owners: Db,
     blob_owners: Db,
     reports: Db,
+    banned_blobs: Db,
+    banned_pubkeys: Db,
     bodies: Db,
     brotli: Db,
     access: Db,
@@ -175,6 +211,8 @@ impl Store {
             env.create_db("bodies", DbFlags::INTEGER_KEY)?,
             env.create_db("brotli", DbFlags::INTEGER_KEY)?,
         );
+        let banned_blobs = env.create_db("banned_blobs", DbFlags::PLAIN)?;
+        let banned_pubkeys = env.create_db("banned_pubkeys", DbFlags::PLAIN)?;
         {
             let mut txn = env.write_txn()?;
             match txn.get(info, b"version")? {
@@ -200,6 +238,8 @@ impl Store {
             owners,
             blob_owners,
             reports,
+            banned_blobs,
+            banned_pubkeys,
             bodies,
             brotli,
             access,
@@ -258,6 +298,36 @@ impl Store {
     /// How many blobs there are.
     pub fn count(&'static self) -> Result<usize> {
         Ok(self.read(|txn| txn.len(self.ids))??)
+    }
+
+    /// Whether `hash` or `pubkey`, either given, is banned.
+    pub fn is_banned(
+        &'static self,
+        hash: Option<&Hash>,
+        pubkey: Option<&[u8; 32]>,
+    ) -> Result<bool> {
+        self.read(|txn| self.banned(txn, hash, pubkey))?
+    }
+
+    /// Every ban, blobs first.
+    pub fn bans(&'static self) -> Result<Vec<Ban>> {
+        self.read(|txn| -> Result<Vec<Ban>> {
+            let mut out = Vec::new();
+            for (db, blob) in [(self.banned_blobs, true), (self.banned_pubkeys, false)] {
+                let mut cur = txn.cursor(db)?;
+                let mut e = cur.first()?;
+                while let Some((k, v)) = e {
+                    let key: [u8; 32] = k.try_into().context("A ban's key is corrupt")?;
+                    let target = match blob {
+                        true => Banned::Blob(Hash(key)),
+                        false => Banned::Pubkey(key),
+                    };
+                    out.push(Ban::decode(target, v).context("A ban is corrupt")?);
+                    e = cur.next()?;
+                }
+            }
+            Ok(out)
+        })?
     }
 
     /// A pubkey's blobs, newest first: at most `limit`, uploaded no later
@@ -463,6 +533,54 @@ impl Store {
         Ok(true)
     }
 
+    pub fn banned(
+        &self,
+        txn: &Txn<'_>,
+        hash: Option<&Hash>,
+        pubkey: Option<&[u8; 32]>,
+    ) -> Result<bool> {
+        if let Some(h) = hash
+            && txn.get(self.banned_blobs, &h.0)?.is_some()
+        {
+            return Ok(true);
+        }
+        Ok(match pubkey {
+            Some(pk) => txn.get(self.banned_pubkeys, pk)?.is_some(),
+            None => false,
+        })
+    }
+
+    pub fn ban(&self, txn: &mut RwTxn<'_>, ban: &Ban) -> Result<()> {
+        let (db, key) = self.ban_key(&ban.target);
+        txn.put(db, key, &ban.encode())?;
+        Ok(())
+    }
+
+    /// Whether it was banned.
+    pub fn unban(&self, txn: &mut RwTxn<'_>, target: &Banned) -> Result<bool> {
+        let (db, key) = self.ban_key(target);
+        Ok(txn.del(db, key, None)?)
+    }
+
+    fn ban_key<'a>(&self, target: &'a Banned) -> (Db, &'a [u8]) {
+        match target {
+            Banned::Blob(h) => (self.banned_blobs, &h.0),
+            Banned::Pubkey(pk) => (self.banned_pubkeys, pk),
+        }
+    }
+
+    /// The seqs of a pubkey's blobs.
+    pub fn owned(&self, txn: &Txn<'_>, pubkey: &[u8; 32]) -> Result<Vec<u64>> {
+        let mut cur = txn.cursor(self.owners)?;
+        let mut out = Vec::new();
+        let mut e = cur.set(pubkey)?;
+        while let Some((_, s)) = e {
+            out.push(stamp_parts(s).1);
+            e = cur.next_dup()?;
+        }
+        Ok(out)
+    }
+
     /// Every blob's seq and record, in seq order, `chunk` at a time, each
     /// chunk read in its own transaction so none is held long.
     pub fn each_record(&'static self, chunk: usize, mut f: impl FnMut(u64, Record)) -> Result<()> {
@@ -634,5 +752,57 @@ mod tests {
         store.touch(&[1, 3], 20_000).unwrap();
         assert_eq!(store.last_read(3).unwrap(), Some(20_000));
         assert_eq!(store.last_read(4).unwrap(), None);
+    }
+
+    #[test]
+    fn bans_and_owned() {
+        let (_dir, store) = temp_store();
+        let (pk, other) = ([7u8; 32], [8u8; 32]);
+        let mut txn = store.write_txn().unwrap();
+        for n in 0..3u8 {
+            let seq = store.next_seq(&txn).unwrap();
+            let r = rec(n, 1000 + n as u64);
+            store.insert(&mut txn, seq, &r, Some(&[n])).unwrap();
+            store.add_owner(&mut txn, seq, r.uploaded, &pk).unwrap();
+        }
+        assert_eq!(store.owned(&txn, &pk).unwrap(), [1, 2, 3]);
+        assert!(store.owned(&txn, &other).unwrap().is_empty());
+
+        let blob = Hash::of(b"bad");
+        for target in [Banned::Blob(blob), Banned::Pubkey(pk)] {
+            let ban = Ban {
+                target,
+                at: 1_760_000_000,
+                reason: "csam".into(),
+            };
+            store.ban(&mut txn, &ban).unwrap();
+        }
+        txn.commit().unwrap();
+
+        assert!(store.is_banned(Some(&blob), None).unwrap());
+        assert!(store.is_banned(None, Some(&pk)).unwrap());
+        assert!(
+            store
+                .is_banned(Some(&Hash::of(b"fine")), Some(&pk))
+                .unwrap()
+        );
+        assert!(
+            !store
+                .is_banned(Some(&Hash::of(b"fine")), Some(&other))
+                .unwrap()
+        );
+        assert!(!store.is_banned(None, None).unwrap());
+        let bans = store.bans().unwrap();
+        assert_eq!(bans.len(), 2);
+        assert_eq!(bans[0].target, Banned::Blob(blob));
+        assert_eq!(bans[1].target, Banned::Pubkey(pk));
+        assert_eq!(bans[1].reason, "csam");
+
+        let mut txn = store.write_txn().unwrap();
+        assert!(store.unban(&mut txn, &Banned::Pubkey(pk)).unwrap());
+        assert!(!store.unban(&mut txn, &Banned::Pubkey(pk)).unwrap());
+        txn.commit().unwrap();
+        assert!(!store.is_banned(None, Some(&pk)).unwrap());
+        assert!(store.is_banned(Some(&blob), None).unwrap());
     }
 }

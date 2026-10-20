@@ -65,6 +65,14 @@ pub async fn mirror(app: &'static App, req: Request<Incoming>, peer: SocketAddr)
         }
         Ok(t) => t,
     };
+    // A token naming one blob names what's coming: refuse it unfetched.
+    let named = token.as_ref().and_then(|t| match t.x.as_slice() {
+        [h] => Some(*h),
+        _ => None,
+    });
+    if let Some(r) = crate::upload::refuse_banned(app, named.as_ref(), token.as_ref()) {
+        return r;
+    }
     if !app.upload_limit.allow(client_ip(app, &req, peer)) {
         return error(
             StatusCode::TOO_MANY_REQUESTS,
@@ -244,12 +252,7 @@ mod tests {
         ] {
             assert!(!public(bad.parse().unwrap()), "{bad}");
         }
-        for good in [
-            "1.1.1.1",
-            "8.8.8.8",
-            "2606:4700::1111",
-            "64:ff9b::101:101",
-        ] {
+        for good in ["1.1.1.1", "8.8.8.8", "2606:4700::1111", "64:ff9b::101:101"] {
             assert!(public(good.parse().unwrap()), "{good}");
         }
         assert!(!allowed(&"http://localhost:3000/x".parse().unwrap()));

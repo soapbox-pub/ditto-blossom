@@ -89,6 +89,25 @@ belong to whoever runs them, and the server must be able to write there.
 
 `ditto-blossom remove SHA256...` takes blobs out entirely, whoever owns them.
 
+## Banning
+
+```sh
+sudo -u ditto-blossom ditto-blossom ban -c /etc/ditto-blossom.toml \
+  --reason "CSAM, NCMEC report 123" --pubkey <hex> ... <sha256> ...
+```
+
+`ban` does what `remove` does, and keeps it out. A banned blob isn't stored
+again, by anyone, by upload, mirror or import. A banned pubkey can't upload
+or mirror, and banning one takes out every blob it owns, whoever else owns
+them, and bans those too, so another key can't put them back. The writer
+checks bans in the transaction that would store a blob, so once a ban is
+committed nothing it names gets in; uploads and `HEAD /upload` are refused
+with 403 before their bodies when the blob or the uploader is known up
+front.
+
+`ditto-blossom unban` lifts bans (a pubkey's blobs stay banned), and
+`ditto-blossom bans` lists them, a line each: kind, hex, when, reason.
+
 ## Developing
 
 ```sh

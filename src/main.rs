@@ -17,6 +17,7 @@ mod lmdb;
 mod log;
 mod mime;
 mod mirror;
+mod moderate;
 mod routes;
 mod send_file;
 mod serve;
@@ -38,13 +39,19 @@ usage:
   ditto-blossom [serve] [-c CONFIG]
   ditto-blossom import [-c CONFIG] --sqlite DB --blobs DIR [--copy] [--verify]
   ditto-blossom remove [-c CONFIG] SHA256...
+  ditto-blossom ban [-c CONFIG] [--reason TEXT] [--pubkey HEX]... [SHA256]...
+  ditto-blossom unban [-c CONFIG] [--pubkey HEX]... [SHA256]...
+  ditto-blossom bans [-c CONFIG]
   ditto-blossom --version
 
 CONFIG defaults to ./ditto-blossom.toml.
 import takes over a blossom-server's blobs: its SQLite database and its blob
 directory. Files are hard-linked into place unless --copy; --verify hashes
 every file, not only the small ones.
-remove takes blobs out entirely, whoever owns them.";
+remove takes blobs out entirely, whoever owns them.
+ban does that and keeps them out: banned blobs aren't stored again, by
+anyone, and banned pubkeys can't upload or mirror. A pubkey's ban takes out
+and bans every blob it owns. unban lifts bans; bans lists them.";
 
 /// How often reads are folded into the access table.
 const ACCESS_FLUSH: Duration = Duration::from_secs(300);
@@ -59,7 +66,9 @@ fn main() {
 fn run() -> Result<()> {
     let mut args = std::env::args().skip(1).peekable();
     let command = match args.peek().map(String::as_str) {
-        Some("serve" | "import" | "remove") => args.next().expect("peeked"),
+        Some("serve" | "import" | "remove" | "ban" | "unban" | "bans") => {
+            args.next().expect("peeked")
+        }
         Some("--version" | "-V") => {
             println!("ditto-blossom {}", env!("CARGO_PKG_VERSION"));
             return Ok(());
@@ -73,6 +82,9 @@ fn run() -> Result<()> {
     let mut config_path = PathBuf::from("ditto-blossom.toml");
     let (mut sqlite, mut dir, mut copy, mut verify) = (None, None, false, false);
     let mut hashes = Vec::new();
+    let (mut pubkeys, mut reason) = (Vec::new(), String::new());
+    let names_blobs = matches!(command.as_str(), "remove" | "ban" | "unban");
+    let targeted = matches!(command.as_str(), "ban" | "unban");
     while let Some(arg) = args.next() {
         let mut value = || args.next().with_context(|| format!("{arg} needs a value"));
         match arg.as_str() {
@@ -81,16 +93,37 @@ fn run() -> Result<()> {
             "--blobs" if command == "import" => dir = Some(PathBuf::from(value()?)),
             "--copy" if command == "import" => copy = true,
             "--verify" if command == "import" => verify = true,
-            hex if command == "remove" && !hex.starts_with('-') => hashes.push(
+            "--reason" if command == "ban" => reason = value()?,
+            "--pubkey" if targeted => {
+                let hex = value()?;
+                pubkeys.push(
+                    hex::decode(&hex)
+                        .ok()
+                        .and_then(|v| <[u8; 32]>::try_from(v).ok())
+                        .with_context(|| format!("{hex} isn't a hex pubkey"))?,
+                );
+            }
+            hex if names_blobs && !hex.starts_with('-') => hashes.push(
                 hash::Hash::parse(hex.as_bytes())
                     .with_context(|| format!("{hex} isn't a SHA-256 hash"))?,
             ),
             _ => bail!("unexpected argument {arg}\n\n{USAGE}"),
         }
     }
+    let targets: Vec<store::Banned> = hashes
+        .iter()
+        .map(|h| store::Banned::Blob(*h))
+        .chain(pubkeys.into_iter().map(store::Banned::Pubkey))
+        .collect();
+    if targeted && targets.is_empty() {
+        bail!("{command} needs a SHA256 or --pubkey\n\n{USAGE}");
+    }
     let config = Config::load(&config_path)?;
     match command.as_str() {
         "remove" => import::remove(&config, &hashes),
+        "ban" => moderate::ban(&config, &targets, &reason),
+        "unban" => moderate::unban(&config, &targets),
+        "bans" => moderate::list(&config),
         "import" => import::run(
             &config,
             &sqlite.context("import needs --sqlite")?,

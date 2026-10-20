@@ -32,6 +32,7 @@ struct Counts {
     unreadable: u64,
     corrupt: u64,
     sniffed: u64,
+    banned: u64,
 }
 
 pub fn run(config: &Config, sqlite: &Path, dir: &Path, copy: bool, verify: bool) -> Result<()> {
@@ -101,7 +102,7 @@ pub fn run(config: &Config, sqlite: &Path, dir: &Path, copy: bool, verify: bool)
                 &mut counts,
             )?;
             batch.clear();
-            crate::info!("import_progress", "added": counts.added, "present": counts.present, "missing": counts.missing, "unreadable": counts.unreadable, "corrupt": counts.corrupt);
+            crate::info!("import_progress", "added": counts.added, "present": counts.present, "missing": counts.missing, "unreadable": counts.unreadable, "corrupt": counts.corrupt, "banned": counts.banned);
         }
         if row.is_none() {
             break;
@@ -115,7 +116,7 @@ pub fn run(config: &Config, sqlite: &Path, dir: &Path, copy: bool, verify: bool)
         "import_finished",
         "added": counts.added, "inline": counts.inline, "present": counts.present, "owners_added": counts.owners,
         "missing": counts.missing, "unreadable": counts.unreadable, "corrupt": counts.corrupt, "sniffed": counts.sniffed,
-        "seconds": started.elapsed().as_secs()
+        "banned": counts.banned, "seconds": started.elapsed().as_secs()
     );
     Ok(())
 }
@@ -133,8 +134,17 @@ fn write_batch(
 ) -> Result<()> {
     let mut txn = store.write_txn()?;
     for (hash, ty, uploaded) in batch {
-        let no_owners = Vec::new();
-        let pks = owners.get(hash).unwrap_or(&no_owners);
+        if store.banned(&txn, Some(hash), None)? {
+            counts.banned += 1;
+            continue;
+        }
+        let mut pks = Vec::new();
+        for pk in owners.get(hash).into_iter().flatten() {
+            if !store.banned(&txn, None, Some(pk))? {
+                pks.push(*pk);
+            }
+        }
+        let pks = &pks;
         if let Some(seq) = store.seq_of(&txn, hash)? {
             counts.present += 1;
             let rec = store

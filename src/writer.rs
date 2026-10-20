@@ -48,6 +48,19 @@ pub enum Deleted {
     NotOwned,
 }
 
+/// The blob, or the pubkey it would belong to, is banned: an insert's or
+/// new owner's error, found with `downcast_ref`.
+#[derive(Debug)]
+pub struct Refused;
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("banned")
+    }
+}
+
+impl std::error::Error for Refused {}
+
 /// A brotli copy, made in the background (see `compress`).
 pub enum BrotliCopy {
     Inline(Vec<u8>),
@@ -162,6 +175,9 @@ fn batch(store: &'static Store, files: &'static Files, jobs: Vec<Job>) {
             }
             Job::AddOwner(hash, owner, reply) => {
                 let r = (|| -> Result<Option<Record>> {
+                    if store.banned(&txn, Some(&hash), Some(&owner))? {
+                        return Err(Refused.into());
+                    }
                     let Some(seq) = store.seq_of(&txn, &hash)? else {
                         return Ok(None);
                     };
@@ -260,6 +276,9 @@ fn insert(
     now: u64,
     placed: &mut Vec<(Hash, bool)>,
 ) -> Result<Stored> {
+    if store.banned(txn, Some(&blob.hash), owner.as_ref())? {
+        return Err(Refused.into());
+    }
     if let Some(seq) = store.seq_of(txn, &blob.hash)? {
         let record = store
             .record(txn, seq)?
