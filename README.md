@@ -68,6 +68,20 @@ systemctl enable --now ditto-blossom
 If `data` isn't `/var/lib/ditto-blossom`, change `ReadWritePaths` in the
 unit to match. Logs are one JSON object per line on stdout.
 
+### Limits, and who skips them
+
+`[upload] max_size` caps a blob's size, and `per_minute` the uploads and
+mirrors one address (one /64 for IPv6) may start a minute. Pubkeys in
+`exempt`, hex, skip both when they sign the request's auth token:
+
+```toml
+[upload]
+exempt = ["781a1527055f74c1f70230f10384609b34548f8ab6a0a6caa74025827f9fdae5"]
+```
+
+They're still subject to bans, to the auth token naming the blob, and to
+the 64 uploads and mirrors the server receives at once.
+
 ## Taking over from blossom-server
 
 ```sh

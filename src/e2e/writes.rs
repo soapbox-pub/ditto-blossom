@@ -344,6 +344,64 @@ async fn mirrors_and_limits() {
 }
 
 #[tokio::test]
+async fn exempt_keys_skip_size_and_rate_limits() {
+    let (vip, other) = (keypair(), keypair());
+    let vip_hex = hex::encode(vip.x_only_public_key().0.to_byte_array());
+    let s = start(&format!(
+        "[upload]\nmax_size = 1000\nper_minute = 2\nexempt = [\"{vip_hex}\"]\n"
+    ))
+    .await;
+    let c = client();
+    let upload = |kp: &secp256k1::Keypair, data: &[u8]| {
+        c.put(format!("{}/upload", s.url))
+            .header("authorization", auth(kp, "upload", &[Hash::of(data)]))
+            .body(data.to_vec())
+            .send()
+    };
+    let head = |kp: &secp256k1::Keypair, len: &str| {
+        c.head(format!("{}/upload", s.url))
+            .header("authorization", auth(kp, "upload", &[]))
+            .header("x-content-length", len)
+            .send()
+    };
+    let big = vec![7u8; 5000];
+
+    assert_eq!(
+        head(&other, "5000").await.unwrap().status(),
+        StatusCode::PAYLOAD_TOO_LARGE
+    );
+    assert_eq!(head(&vip, "5000").await.unwrap().status(), StatusCode::OK);
+    assert_eq!(
+        upload(&other, &big).await.unwrap().status(),
+        StatusCode::PAYLOAD_TOO_LARGE
+    );
+    // The address may start two a minute; the exempt key takes none of them.
+    for i in 0..5u8 {
+        let data = [&big[..], &[i]].concat();
+        assert_eq!(
+            upload(&vip, &data).await.unwrap().status(),
+            StatusCode::CREATED
+        );
+    }
+    assert_eq!(
+        upload(&other, b"one").await.unwrap().status(),
+        StatusCode::CREATED
+    );
+    assert_eq!(
+        upload(&other, b"two").await.unwrap().status(),
+        StatusCode::CREATED
+    );
+    assert_eq!(
+        upload(&other, b"too many").await.unwrap().status(),
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    assert_eq!(
+        upload(&vip, b"three").await.unwrap().status(),
+        StatusCode::CREATED
+    );
+}
+
+#[tokio::test]
 async fn bans_keep_blobs_and_uploaders_out() {
     use crate::store::Banned;
 

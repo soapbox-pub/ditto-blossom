@@ -73,7 +73,7 @@ pub async fn mirror(app: &'static App, req: Request<Incoming>, peer: SocketAddr)
     if let Some(r) = crate::upload::refuse_banned(app, named.as_ref(), token.as_ref()) {
         return r;
     }
-    if !app.upload_limit.allow(client_ip(app, &req, peer)) {
+    if !app.allow_upload(token.as_ref(), client_ip(app, &req, peer)) {
         return error(
             StatusCode::TOO_MANY_REQUESTS,
             "Too many uploads; try again in a minute",
@@ -124,7 +124,8 @@ pub async fn mirror(app: &'static App, req: Request<Incoming>, peer: SocketAddr)
         }
     };
     let length = response.content_length();
-    if length.is_some_and(|l| l > app.config.upload.max_size) {
+    let max_size = app.max_size(token.as_ref());
+    if length.is_some_and(|l| l > max_size) {
         return error(StatusCode::PAYLOAD_TOO_LARGE, "The blob is too large");
     }
     let declared_type = response
@@ -136,7 +137,7 @@ pub async fn mirror(app: &'static App, req: Request<Incoming>, peer: SocketAddr)
         app.files,
         response,
         length,
-        app.config.upload.max_size,
+        max_size,
         declared_type.as_deref(),
     )
     .await

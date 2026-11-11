@@ -27,6 +27,8 @@ open_files = 4096
 require_auth = true
 max_size = 2147483648   # bytes
 per_minute = 60         # uploads and mirrors a client may start
+# Hex pubkeys whose uploads and mirrors skip max_size and per_minute.
+exempt = []
 
 [list]
 enabled = false

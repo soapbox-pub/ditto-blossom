@@ -93,11 +93,9 @@ pub async fn upload(app: &'static App, req: Request<Incoming>, peer: SocketAddr)
     let Some(length) = number(h, header::CONTENT_LENGTH) else {
         return error(StatusCode::LENGTH_REQUIRED, "Uploads need a Content-Length");
     };
-    if length > app.config.upload.max_size {
-        return error(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            &format!("Blobs may be at most {} bytes", app.config.upload.max_size),
-        );
+    let max_size = app.max_size(token.as_ref());
+    if length > max_size {
+        return too_large(max_size);
     }
     let claimed = match header_hash(h) {
         Ok(c) => c,
@@ -111,7 +109,7 @@ pub async fn upload(app: &'static App, req: Request<Incoming>, peer: SocketAddr)
     if let Some(r) = refuse_banned(app, claimed.as_ref(), token.as_ref()) {
         return r;
     }
-    if !app.upload_limit.allow(ip) {
+    if !app.allow_upload(token.as_ref(), ip) {
         return error(
             StatusCode::TOO_MANY_REQUESTS,
             "Too many uploads; try again in a minute",
@@ -145,7 +143,7 @@ pub async fn upload(app: &'static App, req: Request<Incoming>, peer: SocketAddr)
         app.files,
         body,
         Some(length),
-        app.config.upload.max_size,
+        max_size,
         declared_type.as_deref(),
     )
     .await
@@ -200,6 +198,13 @@ pub async fn store(
     }
 }
 
+fn too_large(max_size: u64) -> Response<Body> {
+    error(
+        StatusCode::PAYLOAD_TOO_LARGE,
+        &format!("Blobs may be at most {max_size} bytes"),
+    )
+}
+
 pub fn ingest_error(e: ingest::Error) -> Response<Body> {
     match e {
         ingest::Error::TooLarge => error(StatusCode::PAYLOAD_TOO_LARGE, "The blob is too large"),
@@ -236,11 +241,9 @@ pub fn head_upload(app: &'static App, req: &Request<Incoming>) -> Response<Body>
     let Some(length) = number(h, "x-content-length") else {
         return error(StatusCode::LENGTH_REQUIRED, "X-Content-Length is required");
     };
-    if length > app.config.upload.max_size {
-        return error(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            &format!("Blobs may be at most {} bytes", app.config.upload.max_size),
-        );
+    let max_size = app.max_size(token.as_ref());
+    if length > max_size {
+        return too_large(max_size);
     }
     if let (Some(t), Some(c)) = (&token, &claimed)
         && !t.allows(c)

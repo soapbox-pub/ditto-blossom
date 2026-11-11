@@ -4,7 +4,7 @@
 use anyhow::Result;
 
 use crate::access::Access;
-use crate::auth::Verifier;
+use crate::auth::{Token, Verifier};
 use crate::blobs::Files;
 use crate::compress::Compressor;
 use crate::config::Config;
@@ -31,6 +31,26 @@ pub struct App {
 }
 
 impl App {
+    /// Whether a token's key is exempt from upload limits.
+    pub fn exempt(&self, token: Option<&Token>) -> bool {
+        token.is_some_and(|t| self.config.upload.exempt.contains(&t.pubkey))
+    }
+
+    /// The largest blob a token's key may upload or mirror.
+    pub fn max_size(&self, token: Option<&Token>) -> u64 {
+        if self.exempt(token) {
+            u64::MAX
+        } else {
+            self.config.upload.max_size
+        }
+    }
+
+    /// Whether a client may start another upload or mirror, taking a token
+    /// from its bucket if so. Exempt keys always may, and take none.
+    pub fn allow_upload(&self, token: Option<&Token>, ip: std::net::IpAddr) -> bool {
+        self.exempt(token) || self.upload_limit.allow(ip)
+    }
+
     /// Open everything under the config's data directory and start the
     /// writer and compressor threads. Leaked: it lives as long as the
     /// process, and requests borrow it for good.

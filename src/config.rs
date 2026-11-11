@@ -1,11 +1,13 @@
 //! The config file, TOML. Every setting has a default but `data` and
 //! `public_url`.
 
+use std::collections::HashSet;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use serde::Deserialize;
+use serde::de::Error as _;
+use serde::{Deserialize, Deserializer};
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -51,6 +53,22 @@ pub struct Upload {
     /// Uploads (and mirrors) a client may start a minute.
     #[serde(default = "default_per_minute")]
     pub per_minute: u32,
+    /// Pubkeys, hex, whose uploads and mirrors skip `max_size` and
+    /// `per_minute`, when their auth token is good.
+    #[serde(default, deserialize_with = "pubkeys")]
+    pub exempt: HashSet<[u8; 32]>,
+}
+
+fn pubkeys<'de, D: Deserializer<'de>>(d: D) -> Result<HashSet<[u8; 32]>, D::Error> {
+    Vec::<String>::deserialize(d)?
+        .iter()
+        .map(|s| {
+            hex::decode(s)
+                .ok()
+                .and_then(|b| b.try_into().ok())
+                .ok_or_else(|| D::Error::custom(format!("{s:?} isn't a hex pubkey")))
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -109,6 +127,7 @@ impl Default for Upload {
             require_auth: true,
             max_size: default_max_size(),
             per_minute: default_per_minute(),
+            exempt: HashSet::new(),
         }
     }
 }
@@ -182,5 +201,16 @@ mod tests {
             Config::parse("data = \"/x\"\npublic_url = \"https://a\"\nlisten_on = 3\n").is_err()
         );
         assert!(Config::parse("data = \"/x\"\npublic_url = \"blossom.example.com\"\n").is_err());
+    }
+
+    #[test]
+    fn exempt_takes_hex_pubkeys_only() {
+        let base = "data = \"/x\"\npublic_url = \"https://a\"\n[upload]\n";
+        let key = "781a1527055f74c1f70230f10384609b34548f8ab6a0a6caa74025827f9fdae5";
+        let c = Config::parse(&format!("{base}exempt = [\"{key}\"]\n")).unwrap();
+        let bytes: [u8; 32] = hex::decode(key).unwrap().try_into().unwrap();
+        assert!(c.upload.exempt.contains(&bytes));
+        assert!(Config::parse(&format!("{base}exempt = [\"{}\"]\n", &key[2..])).is_err());
+        assert!(Config::parse(&format!("{base}exempt = [\"npub1xyz\"]\n")).is_err());
     }
 }
