@@ -123,6 +123,34 @@ async fn serves_small_and_large_blobs() {
 }
 
 #[tokio::test]
+async fn sandboxes_blobs_opened_as_pages() {
+    let s = start("").await;
+    let html = b"<!doctype html><script>alert(document.domain)</script>".to_vec();
+    let h = put(s.app, &html, Some("text/html"));
+    let c = client();
+
+    let r = c
+        .get(format!("{}/{}.html", s.url, h.hex()))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    assert_eq!(r.headers()["content-type"], "text/html");
+    assert_eq!(r.headers()["content-security-policy"], "sandbox");
+    assert_eq!(r.headers()["access-control-allow-origin"], "*");
+    assert_eq!(r.bytes().await.unwrap(), html);
+
+    let r = c
+        .get(format!("{}/{}.html", s.url, h.hex()))
+        .header("range", "bytes=0-9")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(r.headers()["content-security-policy"], "sandbox");
+}
+
+#[tokio::test]
 async fn head_conditional_ranges_and_errors() {
     let s = start("").await;
     let data: Vec<u8> = (0..50_000u32).map(|i| i as u8).collect();

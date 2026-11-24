@@ -23,6 +23,9 @@ use crate::server::Body;
 const GZIP_MAX: u64 = 16 << 20;
 const GZIP_MIN: u64 = 512;
 
+/// The policy every blob is served with.
+const CSP: &str = "sandbox";
+
 #[derive(Clone, Copy, PartialEq)]
 enum Coding {
     Identity,
@@ -142,7 +145,11 @@ pub async fn blob(app: &'static App, req: &Request<Incoming>, hash: Hash) -> Res
                 .unwrap_or(HeaderValue::from_static("application/octet-stream")),
         )
         .header(header::ACCEPT_RANGES, "bytes")
-        .header("x-content-type-options", "nosniff");
+        .header("x-content-type-options", "nosniff")
+        // Blobs are anyone's bytes: opened as a page (HTML, SVG), they get
+        // an opaque origin and no scripts, forms or popups. Fetches and
+        // embeds as media ignore this.
+        .header("content-security-policy", CSP);
     match coding {
         Coding::Brotli => builder = builder.header(header::CONTENT_ENCODING, "br"),
         Coding::Gzip => builder = builder.header(header::CONTENT_ENCODING, "gzip"),
