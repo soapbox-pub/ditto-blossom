@@ -73,7 +73,7 @@ retry_every = 300
 # workers = 2            # each ~8 images/s on a core; ~380 MB for them all
 ffmpeg = "ffmpeg"        # video, AVIF, HEIC, JPEG XL; "" passes them unscanned
 refuse_undecodable = true
-require_sandbox = false  # true: don't start unless ffmpeg's files and network are shut off
+require_sandbox = true   # don't start unless ffmpeg's files and network are shut off
 background = false       # store at once and scan after; refused blobs are taken out
 hold = true              # with background: don't serve a blob until it's scanned
 

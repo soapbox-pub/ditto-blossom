@@ -23,6 +23,7 @@ pub fn run(
         .model
         .clone()
         .ok_or_else(|| anyhow::anyhow!("no model: give --model, or [scan] model in the config"))?;
+    super::confine_ffmpeg(scan)?;
     let ffmpeg = (!scan.ffmpeg.as_os_str().is_empty()).then(|| scan.ffmpeg.clone());
     let head = super::load_head(scan)?;
     let rule = super::Rule::of(scan, head.as_deref())?;

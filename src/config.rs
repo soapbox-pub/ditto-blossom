@@ -246,10 +246,11 @@ pub struct Scan {
     /// an upload: a refused blob is taken out when its scan is done.
     #[serde(default)]
     pub background: bool,
-    /// Don't start unless ffmpeg can run with its files and network both
-    /// shut off (see `scan::sandbox`): without, it runs as confined as the
-    /// kernel allows, and the log says how.
-    #[serde(default)]
+    /// Don't start, and never run ffmpeg, unless it can run with its files
+    /// and network both shut off (see `scan::sandbox`). On unless turned
+    /// off; off, it runs as confined as the kernel allows, and the log says
+    /// how.
+    #[serde(default = "yes")]
     pub require_sandbox: bool,
     /// With `background`, don't serve a blob until it's been scanned (503
     /// and Retry-After until then), rather than serving it meanwhile.
@@ -295,7 +296,7 @@ impl Default for Scan {
             ffmpeg: default_ffmpeg(),
             refuse_undecodable: true,
             background: false,
-            require_sandbox: false,
+            require_sandbox: true,
             hold: true,
         }
     }
@@ -477,6 +478,15 @@ mod tests {
         )
         .unwrap();
         assert!(!off.scan.shield() && !off.scan.refuses());
+    }
+
+    #[test]
+    fn ffmpeg_must_be_confined_unless_turned_off() {
+        let base = "data = \"/x\"\npublic_url = \"https://a\"\n";
+        assert!(Config::parse(base).unwrap().scan.require_sandbox);
+        assert!(Scan::default().require_sandbox);
+        let off = Config::parse(&format!("{base}[scan]\nrequire_sandbox = false\n")).unwrap();
+        assert!(!off.scan.require_sandbox);
     }
 
     #[test]

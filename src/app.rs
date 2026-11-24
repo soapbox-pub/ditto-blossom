@@ -85,6 +85,10 @@ impl App {
     /// process, and requests borrow it for good.
     pub fn open(config: Config) -> Result<&'static App> {
         crate::install_crypto();
+        // ffmpeg reads uploads for scanning, and for the dashboard's thumbnails.
+        if config.scan.refuses() || config.admin.listen.is_some() {
+            crate::scan::confine_ffmpeg(&config.scan)?;
+        }
         let store: &'static Store = Box::leak(Box::new(Store::open(&config.data)?));
         let files: &'static Files = Box::leak(Box::new(Files::open(
             &config.data,

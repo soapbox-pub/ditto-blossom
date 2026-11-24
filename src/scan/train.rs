@@ -183,6 +183,7 @@ pub fn run(scan: &config::Scan, o: &Options) -> Result<()> {
         .model
         .clone()
         .context("no encoder: give --model, or [scan] model in the config")?;
+    super::confine_ffmpeg(scan)?;
     let ffmpeg = (!scan.ffmpeg.as_os_str().is_empty()).then(|| scan.ffmpeg.clone());
     let labels: HashMap<String, String> = serde_json::from_str(
         &std::fs::read_to_string(&o.labels)

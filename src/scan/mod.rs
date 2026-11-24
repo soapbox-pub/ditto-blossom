@@ -285,6 +285,33 @@ pub struct Scanner {
     pub turns: Turns,
 }
 
+/// Find out how confined ffmpeg can be here, and log it. Unless
+/// `require_sandbox` is turned off, fail if its files and network can't
+/// both be shut off, and never run it otherwise; turned off, it runs as
+/// confined as the kernel allows. Call it before ffmpeg is first run.
+pub fn confine_ffmpeg(scan: &config::Scan) -> Result<()> {
+    if scan.ffmpeg.as_os_str().is_empty() {
+        return Ok(());
+    }
+    let p = sandbox::probe(&scan.ffmpeg);
+    crate::info!("ffmpeg_sandbox", "landlock_abi": p.landlock, "network_namespace": p.netns,
+        "files_confined": p.files(), "network_confined": p.network());
+    if !(p.files() && p.network()) {
+        if scan.require_sandbox {
+            bail!(
+                "ffmpeg can't be confined here (files {}, network {}): it needs Landlock \
+                 (Linux 5.13+), and Linux 6.7+ or user namespaces. Set [scan] \
+                 require_sandbox = false to run it as confined as this kernel allows",
+                p.files(),
+                p.network()
+            );
+        }
+        crate::warn!("ffmpeg_unconfined", "files_confined": p.files(), "network_confined": p.network());
+    }
+    sandbox::require(scan.require_sandbox);
+    Ok(())
+}
+
 impl Scanner {
     /// Load the encoder and start the workers, failing if it can't load.
     pub fn start(scan: &config::Scan) -> Result<Scanner> {
@@ -293,23 +320,6 @@ impl Scanner {
             .clone()
             .context("[scan] needs `model`, the image encoder's path")?;
         let ffmpeg = (!scan.ffmpeg.as_os_str().is_empty()).then(|| scan.ffmpeg.clone());
-        if let Some(ff) = &ffmpeg {
-            let p = sandbox::probe(ff);
-            crate::info!("ffmpeg_sandbox", "landlock_abi": p.landlock, "network_namespace": p.netns,
-                "files_confined": p.files(), "network_confined": p.network());
-            if !(p.files() && p.network()) {
-                if scan.require_sandbox {
-                    bail!(
-                        "scan.require_sandbox: ffmpeg can't be confined here (files {}, network {}); \
-                         it needs Landlock (Linux 5.13+), and 6.7+ or user namespaces",
-                        p.files(),
-                        p.network()
-                    );
-                }
-                crate::warn!("ffmpeg_unconfined", "files_confined": p.files(), "network_confined": p.network());
-            }
-            sandbox::require(scan.require_sandbox);
-        }
         let head = load_head(scan)?;
         let rule = Rule::of(scan, head.as_deref())?;
         let workers = scan.workers.unwrap_or_else(default_workers).max(1);

@@ -208,9 +208,10 @@ Use a static ffmpeg build. It runs with a 60-second limit, no new
 privileges, 4 GiB of memory, Landlock (Linux 5.13+) limiting it to the blob
 and system libraries, and no network: its own network namespace, or under
 the systemd unit (which forbids namespaces) Landlock on Linux 6.7+. The
-`ffmpeg_sandbox` log line at startup says what it got; `require_sandbox =
-true` refuses to start without both. `ffmpeg = ""` passes those formats
-unscanned.
+`ffmpeg_sandbox` log line at startup says what it got. Without both, the
+server won't start (nor `scan` of files, or `train`), unless
+`require_sandbox = false` lets ffmpeg run as confined as the kernel allows.
+`ffmpeg = ""` passes those formats unscanned.
 
 ### Limits
 
