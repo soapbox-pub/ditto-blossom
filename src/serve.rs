@@ -23,7 +23,7 @@ use crate::server::Body;
 const GZIP_MAX: u64 = 16 << 20;
 const GZIP_MIN: u64 = 512;
 
-/// The policy every blob is served with.
+/// The policy every blob but a PDF is served with.
 const CSP: &str = "sandbox";
 
 #[derive(Clone, Copy, PartialEq)]
@@ -49,8 +49,17 @@ pub async fn blob(app: &'static App, req: &Request<Incoming>, hash: Hash) -> Res
             );
         }
     };
-    app.access.touch(found.seq);
     let rec = &found.record;
+    if rec.has(crate::store::flag::UNSCANNED) && app.config.scan.hold && app.scanner.is_some() {
+        let mut r = error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "This blob is being checked; try again shortly",
+        );
+        r.headers_mut()
+            .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+        return r;
+    }
+    app.access.touch(found.seq);
     let ty = rec.mime.as_deref();
     let compressible = mime::compressible(ty);
     let coding = if found.brotli {
@@ -145,11 +154,13 @@ pub async fn blob(app: &'static App, req: &Request<Incoming>, hash: Hash) -> Res
                 .unwrap_or(HeaderValue::from_static("application/octet-stream")),
         )
         .header(header::ACCEPT_RANGES, "bytes")
-        .header("x-content-type-options", "nosniff")
-        // Blobs are anyone's bytes: opened as a page (HTML, SVG), they get
-        // an opaque origin and no scripts, forms or popups. Fetches and
-        // embeds as media ignore this.
-        .header("content-security-policy", CSP);
+        .header("x-content-type-options", "nosniff");
+    // Blobs are anyone's bytes: opened as a page (HTML, SVG), they get an
+    // opaque origin and no scripts, forms or popups. Fetches and embeds as
+    // media ignore this. PDFs are spared: browsers won't show them sandboxed.
+    if ty != Some("application/pdf") {
+        builder = builder.header(header::CONTENT_SECURITY_POLICY, CSP);
+    }
     match coding {
         Coding::Brotli => builder = builder.header(header::CONTENT_ENCODING, "br"),
         Coding::Gzip => builder = builder.header(header::CONTENT_ENCODING, "gzip"),

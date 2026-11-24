@@ -50,6 +50,8 @@ pub mod flag {
     pub const BROTLI: u8 = 2;
     /// Compression has been tried, whether or not a copy was kept.
     pub const BROTLI_CHECKED: u8 = 4;
+    /// Stored before it was scanned, and not scanned yet (see `scan`).
+    pub const UNSCANNED: u8 = 8;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -161,6 +163,9 @@ pub struct Found {
     /// The copy's bytes, if they're inline.
     pub body: Option<Bytes>,
 }
+
+/// A blob's seq, record and owners.
+type Owned = (u64, Record, Vec<[u8; 32]>);
 
 pub struct Store {
     env: Env,
@@ -598,6 +603,38 @@ impl Store {
         Ok(txn.del(db, key, None)?)
     }
 
+    /// A target's ban, if it's banned.
+    pub fn ban_of(&self, txn: &Txn<'_>, target: Banned) -> Result<Option<Ban>> {
+        let (db, key) = self.ban_key(&target);
+        Ok(txn.get(db, key)?.and_then(|v| Ban::decode(target, v)))
+    }
+
+    /// How many blobs, and how many pubkeys, are banned.
+    pub fn ban_counts(&self, txn: &Txn<'_>) -> Result<(usize, usize)> {
+        Ok((txn.len(self.banned_blobs)?, txn.len(self.banned_pubkeys)?))
+    }
+
+    /// How many reports are kept.
+    pub fn report_count(&self, txn: &Txn<'_>) -> Result<usize> {
+        Ok(txn.len(self.reports)?)
+    }
+
+    /// Every report kept, with the blob it names, in order of blob.
+    pub fn reports(&self, txn: &Txn<'_>) -> Result<Vec<(Hash, Vec<u8>)>> {
+        let mut cur = txn.cursor(self.reports)?;
+        let mut out = Vec::new();
+        let mut e = cur.first()?;
+        while let Some((k, json)) = e {
+            let hash: [u8; 32] = k
+                .get(..32)
+                .and_then(|h| h.try_into().ok())
+                .context("A report's key is corrupt")?;
+            out.push((Hash(hash), json.to_vec()));
+            e = cur.next()?;
+        }
+        Ok(out)
+    }
+
     fn ban_key<'a>(&self, target: &'a Banned) -> (Db, &'a [u8]) {
         match target {
             Banned::Blob(h) => (self.banned_blobs, &h.0),
@@ -612,6 +649,21 @@ impl Store {
             .map(<[u8]>::to_vec))
     }
 
+    /// The reports (kind 1984 events' JSON) kept about a blob.
+    pub fn reports_of(&self, txn: &Txn<'_>, hash: &Hash) -> Result<Vec<Vec<u8>>> {
+        let mut cur = txn.cursor(self.reports)?;
+        let mut out = Vec::new();
+        let mut e = cur.set_range(&hash.0)?;
+        while let Some((k, json)) = e {
+            if !k.starts_with(&hash.0) {
+                break;
+            }
+            out.push(json.to_vec());
+            e = cur.next()?;
+        }
+        Ok(out)
+    }
+
     /// The seqs of a pubkey's blobs.
     pub fn owned(&self, txn: &Txn<'_>, pubkey: &[u8; 32]) -> Result<Vec<u64>> {
         let mut cur = txn.cursor(self.owners)?;
@@ -622,6 +674,80 @@ impl Store {
             e = cur.next_dup()?;
         }
         Ok(out)
+    }
+
+    /// Blobs newest first, from below `before` (a seq) if given: those
+    /// `keep` takes, at most `limit` of them, looking at no more than
+    /// `budget`. And the seq to go on below, unless that was the last.
+    pub fn recent(
+        &'static self,
+        before: Option<u64>,
+        limit: usize,
+        budget: usize,
+        keep: impl Fn(&Record) -> bool,
+    ) -> Result<(Vec<Record>, Option<u64>)> {
+        self.read(|txn| -> Result<(Vec<Record>, Option<u64>)> {
+            let mut cur = txn.cursor(self.blobs)?;
+            let mut e = match before {
+                Some(b) => match cur.set_range(&b.to_ne_bytes())? {
+                    Some(_) => cur.prev()?,
+                    None => cur.last()?,
+                },
+                None => cur.last()?,
+            };
+            let (mut out, mut looked) = (Vec::new(), 0);
+            while let Some((k, v)) = e {
+                let seq = u64::from_ne_bytes(k.try_into().context("A blob key is corrupt")?);
+                if out.len() >= limit || looked >= budget {
+                    return Ok((out, Some(seq + 1)));
+                }
+                looked += 1;
+                let rec = Record::decode(v).context("A blob record is corrupt")?;
+                if keep(&rec) {
+                    out.push(rec);
+                }
+                e = cur.prev()?;
+            }
+            Ok((out, None))
+        })?
+    }
+
+    /// Every blob's seq, record and owners, `chunk` at a time as
+    /// `each_record`.
+    pub fn each_record_owned(
+        &'static self,
+        chunk: usize,
+        mut f: impl FnMut(u64, Record, Vec<[u8; 32]>),
+    ) -> Result<()> {
+        let mut from = 0u64;
+        loop {
+            let batch = self.read(|txn| -> Result<Vec<Owned>> {
+                let mut cur = txn.cursor(self.blobs)?;
+                let mut out = Vec::new();
+                let mut e = cur.set_range(&from.to_ne_bytes())?;
+                while let Some((k, v)) = e {
+                    let seq = u64::from_ne_bytes(k.try_into().context("A blob key is corrupt")?);
+                    let rec = Record::decode(v).context("A blob record is corrupt")?;
+                    out.push((seq, rec, self.owners_of(txn, seq)?));
+                    if out.len() == chunk {
+                        break;
+                    }
+                    e = cur.next()?;
+                }
+                Ok(out)
+            })??;
+            let Some(&(last, _, _)) = batch.last() else {
+                return Ok(());
+            };
+            let done = batch.len() < chunk;
+            for (seq, rec, owners) in batch {
+                f(seq, rec, owners);
+            }
+            if done {
+                return Ok(());
+            }
+            from = last + 1;
+        }
     }
 
     /// Every blob's seq and record, in seq order, `chunk` at a time, each
@@ -665,6 +791,23 @@ impl Store {
         }
         txn.commit()?;
         Ok(())
+    }
+
+    /// The day each blob was last read, by seq, for those read since stats
+    /// began.
+    pub fn last_reads(&self) -> Result<std::collections::HashMap<u64, u16>> {
+        let txn = self.stats.read_txn()?;
+        let mut cur = txn.cursor(self.access)?;
+        let mut out = std::collections::HashMap::new();
+        let mut e = cur.first()?;
+        while let Some((k, v)) = e {
+            let seq = u64::from_ne_bytes(k.try_into().context("An access key is corrupt")?);
+            if let Ok(day) = <[u8; 2]>::try_from(v) {
+                out.insert(seq, u16::from_le_bytes(day));
+            }
+            e = cur.next()?;
+        }
+        Ok(out)
     }
 
     /// The day a blob was last read, if it has been since stats began.

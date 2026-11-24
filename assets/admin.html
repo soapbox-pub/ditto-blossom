@@ -1,0 +1,194 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex, nofollow">
+  <title>Blossom admin</title>
+  <link rel="icon" href="/favicon.ico">
+  <link rel="stylesheet" href="/admin.css">
+</head>
+<body>
+  <main id="login" hidden>
+    <div class="card login-card">
+      <div class="login-banner"><img src="/banner.jpg" alt=""></div>
+      <div class="login-icon"><img src="/icon.png" alt=""></div>
+      <div class="login-body">
+        <h1>Blossom admin</h1>
+        <p class="dim">Moderation for <b>{{host}}</b>. Sign in with your Nostr extension; only this server's admins can.</p>
+        <button class="btn primary wide" id="sign-in" type="button">Sign in with Nostr</button>
+        <p id="login-error" role="alert"></p>
+      </div>
+    </div>
+    <p class="login-footer">Ditto Blossom v{{version}}</p>
+  </main>
+
+  <div id="app" hidden>
+    <a class="skip" href="#main">Skip to content</a>
+    <header>
+      <h1 class="brand"><img src="/icon.png" alt="">Blossom admin</h1>
+      <nav aria-label="Sections">
+        <ul>
+          <li><a href="#overview">Home</a></li>
+          <li><a href="#media">Media</a></li>
+          <li><a href="#review" id="nav-mod">Moderation <span class="badge bad" id="unreported" hidden></span></a></li>
+          <li><a href="#usage">Usage</a></li>
+        </ul>
+      </nav>
+      <form class="search" id="lookup-form" role="search">
+        <label for="lookup-input" class="vh">Search a file, link or account</label>
+        <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
+        <input type="search" id="lookup-input" placeholder="Search a file, link or account" autocomplete="off" spellcheck="false" enterkeyhint="search">
+        <kbd aria-hidden="true">/</kbd>
+      </form>
+      <div class="me">
+        <span id="who"></span>
+        <button class="btn soft-danger sm" id="purge" type="button" hidden></button>
+        <a class="btn ghost icon sm help-link" href="#help" aria-label="Help" title="Help">?</a>
+        <button class="btn ghost sm" id="sign-out" type="button">Sign out</button>
+      </div>
+    </header>
+
+    <main id="main" tabindex="-1">
+      <section id="tab-overview" aria-labelledby="h-overview">
+        <h2 id="h-overview" tabindex="-1">Home</h2>
+        <div class="stack">
+          <div id="todo"></div>
+          <div class="next" id="next"></div>
+          <div id="overview"></div>
+          <details class="card quiet">
+            <summary>Server details</summary>
+            <dl class="facts" id="server"></dl>
+          </details>
+        </div>
+      </section>
+
+      <div class="mod" id="mod" hidden>
+        <nav class="mod-nav" aria-label="Moderation">
+          <p class="mod-group">Needs you</p>
+          <a href="#review"><span>Review uploads</span></a>
+          <a href="#reports"><span>Reports</span><span class="count" id="count-reports"></span></a>
+          <a href="#evidence" id="nav-evidence" hidden><span>Evidence</span><span class="count" id="count-evidence"></span></a>
+          <p class="mod-group">Browse</p>
+          <a href="#bans"><span>Bans</span><span class="count" id="count-bans"></span></a>
+        </nav>
+        <div class="mod-body">
+          <section id="tab-review" aria-labelledby="h-review" hidden>
+            <h2 id="h-review" tabindex="-1">Review</h2>
+            <p class="intro">New pictures and video, one at a time. Fine, or not allowed.</p>
+            <div id="review"></div>
+          </section>
+          <section id="tab-reports" aria-labelledby="h-reports" hidden>
+            <h2 id="h-reports" tabindex="-1">Reports</h2>
+            <p class="intro">What people have flagged. Look first, then decide.</p>
+            <div class="card" id="reports-list"></div>
+          </section>
+          <section id="tab-evidence" aria-labelledby="h-evidence" hidden>
+            <h2 id="h-evidence" tabindex="-1">Evidence</h2>
+            <p class="intro">Kept for NCMEC: report each one, then keep it for a year.</p>
+            <div class="stack">
+            <p class="dim small"><a href="#help">How reporting works</a></p>
+            <div id="evidence-list" class="stack"></div>
+            </div>
+          </section>
+          <section id="tab-bans" aria-labelledby="h-bans" hidden>
+            <h2 id="h-bans" tabindex="-1">Bans</h2>
+            <p class="intro">Files and accounts that can't come back.</p>
+            <div class="card stack">
+            <div class="row">
+              <span class="grow">
+                <label for="bans-filter" class="vh">Filter</label>
+                <input type="text" id="bans-filter" placeholder="Find a ban by hash, account or reason" autocomplete="off" spellcheck="false">
+              </span>
+              <fieldset class="seg" id="bans-kind">
+                <legend class="vh">Kind</legend>
+                <label><input type="radio" name="bans-kind" value="" checked><span>All</span></label>
+                <label><input type="radio" name="bans-kind" value="blob"><span>Files</span></label>
+                <label><input type="radio" name="bans-kind" value="pubkey"><span>Accounts</span></label>
+              </fieldset>
+            </div>
+            <div id="bans-list"></div>
+            </div>
+          </section>
+          </div>
+      </div>
+
+      <section id="tab-media" aria-labelledby="h-media" hidden>
+      <h2 id="h-media" tabindex="-1">Media</h2>
+      <p class="intro">Everything uploaded, newest first. Open any of it to look closer.</p>
+      <div class="toolbar">
+        <fieldset class="seg" id="media-kind">
+          <legend class="vh">Show</legend>
+          <label><input type="radio" name="media-kind" value="media" checked><span>All</span></label>
+          <label><input type="radio" name="media-kind" value="image"><span>Images</span></label>
+          <label><input type="radio" name="media-kind" value="video"><span>Video</span></label>
+        </fieldset>
+        <label class="switch"><input type="checkbox" role="switch" id="blur-media" class="blur-toggle" checked><span class="track"></span>Blur</label>
+        <label class="switch" id="unlabelled-switch" hidden><input type="checkbox" role="switch" id="media-unlabelled"><span class="track"></span>Unlabelled only</label>
+        <span class="grow"></span>
+        <span class="dim small" id="media-status" role="status"></span>
+        <button class="btn ghost sm" type="button" id="media-reload" title="Show anything uploaded since">Check for new</button>
+      </div>
+      <ul class="grid" id="media-grid" aria-label="Stored media"></ul>
+      <div class="row center more"><button class="btn" type="button" id="media-more" hidden>Load older</button></div>
+      </section>
+
+      <section id="tab-usage" aria-labelledby="h-usage" hidden>
+        <h2 id="h-usage" tabindex="-1">Usage</h2>
+        <p class="intro">What's stored here, how it grows, and how much of it is read.</p>
+        <div id="usage" class="stack"></div>
+      </section>
+
+      <section id="tab-lookup" aria-labelledby="h-lookup" hidden>
+        <h2 id="h-lookup" class="vh" tabindex="-1">Search</h2>
+        <div id="lookup-result" class="stack"></div>
+      </section>
+
+      <section id="tab-help" aria-labelledby="h-help" hidden>
+        <h2 id="h-help" tabindex="-1">Help</h2>
+        <div class="stack prose">
+          <div class="card">
+            <h3>The buttons</h3>
+            <ul class="legend">
+              <li><span class="pip good">✓</span><div><b>Looks fine</b> marks it checked. You won't see it in Review again.</div></li>
+              <li><span class="pip bad">✕</span><div><b>Not allowed</b> or <b>Ban</b> deletes it, and stops it being uploaded again. You get a few seconds to undo.</div></li>
+              <li><span class="pip">−</span><div><b>Remove</b> just deletes it. It can be uploaded again.</div></li>
+              <li><span class="pip">↻</span><div><b>Purge</b>, top right, appears when <code>admin.cdn</code> names a cache in front of this server, like Cloudflare: it may keep serving what you delete for up to a year, until you purge it there.</div></li>
+              <li><span class="pip warn">!</span><div><b>Child abuse</b> is only for child sexual abuse material. See below.</div></li>
+            </ul>
+            <p class="dim small">In Review, keys work too: <kbd>1</kbd> looks fine, <kbd>2</kbd> not allowed, <kbd>space</kbd> skip, <kbd>U</kbd> undo.</p>
+          </div>
+
+          <div class="card" id="csam">
+            <h3>If you see child abuse</h3>
+            <ol class="steps big">
+              <li><div><b>Press Child abuse.</b> It's hidden from everyone, the uploader is banned, and a locked copy of it and of all they uploaded is kept for the report. Don't use Ban or Remove: they delete the copy.</div></li>
+              <li><div><b>Report it to NCMEC</b>, the same day if you can. Evidence has what to copy into the form.</div></li>
+              <li><div><b>Enter the report number</b> in Evidence. The copy is deleted a year later.</div></li>
+            </ol>
+            <div class="callout">
+              <div><b>Do this once, now:</b> register with NCMEC as a service provider. It's free and takes a few days.</div>
+              <a class="btn primary" href="https://esp.ncmec.org/registration" target="_blank" rel="noopener noreferrer">Register ↗</a>
+            </div>
+            <details>
+              <summary>More detail</summary>
+              <p>US law asks you to report child sexual abuse material you know of to NCMEC, the National Center for Missing &amp; Exploited Children, and to keep a copy for a year after (18 U.S.C. § 2258A). Outside the US, check your own country's rules.</p>
+              <p>Not registered yet? Report it anyway, on the <a href="https://report.cybertip.org/" target="_blank" rel="noopener noreferrer">public form</a> or at 1-800-843-5678, and say you've kept a copy.</p>
+              <p>Don't download it, look at it again, or show it to anyone but NCMEC or the police. If the police ask you to destroy it, delete its files from the evidence folder.</p>
+              <p>If a CDN sits in front of this server, purge the file there too: the Purge button, top right, lists what to purge. If your web server keeps logs, keep its lines for the file.</p>
+            </details>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <dialog id="dialog" aria-labelledby="dialog-title"></dialog>
+  <dialog id="lightbox" class="lightbox" aria-label="Media viewer"></dialog>
+  <div id="toasts">
+    <div id="status" role="status"></div>
+    <div id="alert" role="alert"></div>
+  </div>
+  <script src="/admin.js"></script>
+</body>
+</html>

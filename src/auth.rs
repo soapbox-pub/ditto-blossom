@@ -193,6 +193,61 @@ pub fn verify_report(json: &[u8]) -> Result<([u8; 32], Vec<Hash>), &'static str>
     Ok((id, hashes))
 }
 
+/// How far from now a NIP-98 event's `created_at` may be.
+const HTTP_AUTH_WINDOW: u64 = 60;
+
+/// NIP-98 HTTP auth: a kind 27235 event in `Authorization: Nostr …`, made
+/// within a minute of now, whose `u` tag is `url` and whose `method` tag
+/// is `method`. `url` is the caller's to know, never the request's Host,
+/// which is whoever sent it's to write: an event signed for another site
+/// would sign in here by naming that site. Its pubkey, and its id, so a
+/// caller can refuse one used before.
+pub fn verify_http(
+    headers: &HeaderMap,
+    method: &str,
+    url: &str,
+    now: u64,
+) -> Result<([u8; 32], [u8; 32]), &'static str> {
+    let value = headers
+        .get(hyper::header::AUTHORIZATION)
+        .ok_or("Sign in with a NIP-98 Authorization header")?
+        .to_str()
+        .map_err(|_| "The Authorization header isn't text")?;
+    let b64 = value
+        .trim()
+        .split_once(' ')
+        .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("nostr"))
+        .map(|(_, b64)| b64.trim())
+        .ok_or("The Authorization header isn't a Nostr event")?;
+    if b64.len() > MAX_HEADER {
+        return Err("The Authorization header is too long");
+    }
+    let json = decode_base64(b64).ok_or("The Authorization header isn't base64")?;
+    let ev: Event = serde_json::from_slice(&json).map_err(|_| "That isn't a Nostr event")?;
+    if ev.kind != 27235 {
+        return Err("A NIP-98 event is kind 27235");
+    }
+    if ev.created_at.abs_diff(now) > HTTP_AUTH_WINDOW {
+        return Err("The event wasn't made within a minute of now");
+    }
+    let tag = |name: &str| {
+        ev.tags
+            .iter()
+            .find(|t| t.first().is_some_and(|n| n == name))
+            .and_then(|t| t.get(1))
+    };
+    let signed = tag("u").ok_or("The event has no u tag")?;
+    if !signed.eq_ignore_ascii_case(url) {
+        return Err("The event is for another URL");
+    }
+    if !tag("method").is_some_and(|m| m.eq_ignore_ascii_case(method)) {
+        return Err("The event is for another method");
+    }
+    let (pubkey, id) = ids(&ev)?;
+    signature(&ev, &pubkey, &id)?;
+    Ok((pubkey, id))
+}
+
 /// Standard or URL-safe, padded or not: BUD-11 now says unpadded URL-safe,
 /// but clients written before it send standard base64.
 fn decode_base64(s: &str) -> Option<Vec<u8>> {
@@ -319,11 +374,22 @@ pub mod tests {
 
     /// Any signed event, as JSON.
     pub fn signed(kp: &Keypair, kind: u64, tags: Vec<Vec<String>>, content: &str) -> String {
+        signed_at(kp, kind, 1_760_000_000, tags, content)
+    }
+
+    /// A signed event made at `created_at`, as JSON.
+    pub fn signed_at(
+        kp: &Keypair,
+        kind: u64,
+        created_at: u64,
+        tags: Vec<Vec<String>>,
+        content: &str,
+    ) -> String {
         let pubkey = hex::encode(kp.x_only_public_key().0.to_byte_array());
         let mut ev = Event {
             id: String::new(),
             pubkey,
-            created_at: 1_760_000_000,
+            created_at,
             kind,
             tags,
             content: content.into(),
@@ -434,6 +500,62 @@ pub mod tests {
         assert_eq!(
             refused(&tampered, "upload"),
             "The event's id doesn't match it"
+        );
+    }
+
+    /// A NIP-98 Authorization header for `url` and `method`, made at `at`.
+    pub fn http_auth(kp: &Keypair, url: &str, method: &str, at: u64) -> String {
+        let tags = vec![
+            vec!["u".into(), url.into()],
+            vec!["method".into(), method.into()],
+        ];
+        let json = signed_at(kp, 27235, at, tags, "");
+        format!(
+            "Nostr {}",
+            base64::engine::general_purpose::STANDARD.encode(json)
+        )
+    }
+
+    #[test]
+    fn checks_nip98_events() {
+        let kp = keypair();
+        let now = 1_800_000_000;
+        let url = "http://127.0.0.1:3001/api/login";
+        let check = |h: &str, method: &str, url: &str| verify_http(&headers(h), method, url, now);
+        let ok = http_auth(&kp, url, "POST", now - 10);
+        let (pk, _) = check(&ok, "POST", url).unwrap();
+        assert_eq!(pk, kp.x_only_public_key().0.to_byte_array());
+        assert!(
+            check(
+                &http_auth(&kp, &url.to_uppercase(), "post", now),
+                "POST",
+                url
+            )
+            .is_ok()
+        );
+        assert_eq!(
+            check(&ok, "GET", url).unwrap_err(),
+            "The event is for another method"
+        );
+        // Another path, scheme or host is another URL.
+        for other in [
+            "http://127.0.0.1:3001/api/ban",
+            "https://127.0.0.1:3001/api/login",
+            "http://evil.example/api/login",
+        ] {
+            assert_eq!(
+                check(&ok, "POST", other).unwrap_err(),
+                "The event is for another URL"
+            );
+        }
+        assert_eq!(
+            check(&http_auth(&kp, url, "POST", now - 120), "POST", url).unwrap_err(),
+            "The event wasn't made within a minute of now"
+        );
+        let upload = token(&kp, "upload", &[], None, now + 60, now);
+        assert_eq!(
+            check(&upload, "POST", url).unwrap_err(),
+            "A NIP-98 event is kind 27235"
         );
     }
 

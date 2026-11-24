@@ -1,6 +1,7 @@
 //! ditto-blossom: a Blossom server on LMDB, built for ext4 and sendfile.
 
 mod access;
+mod admin;
 mod app;
 mod auth;
 mod blobs;
@@ -46,6 +47,8 @@ usage:
   ditto-blossom unban [-c CONFIG] [--pubkey HEX]... [SHA256]...
   ditto-blossom bans [-c CONFIG]
   ditto-blossom scan [-c CONFIG] [--from SEQ] [--limit N] [--dry-run]
+  ditto-blossom scan [-c CONFIG | --model ENCODER --head HEAD] [--threshold T] [--ffmpeg PATH] [--jobs N] [--refused] PATH...
+  ditto-blossom train [-c CONFIG | --model ENCODER] --labels LABELS --out HEAD [--blobs DIR]... [--catch 0.99] [--c 3] [--jobs N] [--scores FILE] [--cache FILE]
   ditto-blossom pdq FILE...
   ditto-blossom --version
 
@@ -58,10 +61,17 @@ ban does that and keeps them out: banned blobs aren't stored again, by
 anyone, and banned pubkeys can't upload or mirror. A pubkey's ban takes out
 and bans every blob it owns; --preserve copies each blob it removes to DIR
 first. unban lifts bans; bans lists them.
-scan asks Arachnid Shield about every image already here, and deals with
-each match as an upload's: preserved, banned with its uploaders, recorded
-and alerted. --from carries on from the seq a stopped scan gave; --limit
-stops after N blobs; --dry-run only lists matches.
+scan, given no files, asks Arachnid Shield about every image already here,
+and deals with each match as an upload's: preserved, banned with its
+uploaders, recorded and alerted. --from carries on from the seq a stopped
+scan gave; --limit stops after N blobs; --dry-run only lists matches.
+scan, given files and directories, scores them for explicit media as
+uploads would be, one JSON line each; --refused prints only those that
+would be refused. Pointed at the data's blobs/ directory, the names it
+prints are hashes `ban` takes.
+train fits the scan head to LABELS, {\"<sha256>\": \"explicit\" | \"clean\"},
+finding the blobs under each --blobs DIR (the data's blobs/ if none), and
+chooses the threshold that catches --catch of the explicit, unseen.
 pdq prints each image's PDQ hash (base64) and quality, as scan sends them.";
 
 /// How often reads are folded into the access table.
@@ -77,9 +87,9 @@ fn main() {
 fn run() -> Result<()> {
     let mut args = std::env::args().skip(1).peekable();
     let command = match args.peek().map(String::as_str) {
-        Some("serve" | "import" | "remove" | "ban" | "unban" | "bans" | "scan" | "pdq") => {
-            args.next().expect("peeked")
-        }
+        Some(
+            "serve" | "import" | "remove" | "ban" | "unban" | "bans" | "scan" | "train" | "pdq",
+        ) => args.next().expect("peeked"),
         Some("--version" | "-V") => {
             println!("ditto-blossom {}", env!("CARGO_PKG_VERSION"));
             return Ok(());
@@ -95,13 +105,44 @@ fn run() -> Result<()> {
     let mut hashes = Vec::new();
     let (mut pubkeys, mut reason, mut preserve) = (Vec::new(), String::new(), None);
     let (mut from, mut limit, mut dry_run) = (0u64, None, false);
-    let mut paths = Vec::new();
     let names_blobs = matches!(command.as_str(), "remove" | "ban" | "unban");
     let targeted = matches!(command.as_str(), "ban" | "unban");
+    // scan and train
+    let scanning = command == "scan" || command == "train";
+    let (mut model, mut head, mut threshold, mut ffmpeg, mut jobs) = (None, None, None, None, None);
+    let (mut refused, mut paths) = (false, Vec::new());
+    let (mut labels, mut out, mut scores, mut blob_dirs) = (None, None, None, Vec::new());
+    let mut cache = None;
+    let (mut catch, mut c) = (0.99f64, 3.0f64);
+    let mut config_given = false;
     while let Some(arg) = args.next() {
         let mut value = || args.next().with_context(|| format!("{arg} needs a value"));
+        let mut number = |what: &str| -> Result<f64> {
+            value()?
+                .parse()
+                .with_context(|| format!("{what} is a number"))
+        };
         match arg.as_str() {
-            "-c" | "--config" => config_path = value()?.into(),
+            "-c" | "--config" => {
+                config_path = value()?.into();
+                config_given = true;
+            }
+            "--model" if scanning => model = Some(PathBuf::from(value()?)),
+            "--ffmpeg" if scanning => ffmpeg = Some(PathBuf::from(value()?)),
+            "--jobs" if scanning => jobs = Some(number("--jobs")?.max(1.0) as usize),
+            "--head" if command == "scan" => head = Some(PathBuf::from(value()?)),
+            "--threshold" if command == "scan" => threshold = Some(number("--threshold")? as f32),
+            "--refused" if command == "scan" => refused = true,
+            path if (command == "scan" || command == "pdq") && !path.starts_with('-') => {
+                paths.push(PathBuf::from(path))
+            }
+            "--labels" if command == "train" => labels = Some(PathBuf::from(value()?)),
+            "--out" if command == "train" => out = Some(PathBuf::from(value()?)),
+            "--scores" if command == "train" => scores = Some(PathBuf::from(value()?)),
+            "--cache" if command == "train" => cache = Some(PathBuf::from(value()?)),
+            "--blobs" if command == "train" => blob_dirs.push(PathBuf::from(value()?)),
+            "--catch" if command == "train" => catch = number("--catch")?,
+            "--c" if command == "train" => c = number("--c")?,
             "--sqlite" if command == "import" => sqlite = Some(PathBuf::from(value()?)),
             "--blobs" if command == "import" => dir = Some(PathBuf::from(value()?)),
             "--copy" if command == "import" => copy = true,
@@ -115,7 +156,6 @@ fn run() -> Result<()> {
                 limit = Some(value()?.parse().context("--limit takes a number")?)
             }
             "--dry-run" if command == "scan" => dry_run = true,
-            path if command == "pdq" && !path.starts_with('-') => paths.push(PathBuf::from(path)),
             "--pubkey" if targeted => {
                 let hex = value()?;
                 pubkeys.push(
@@ -131,6 +171,58 @@ fn run() -> Result<()> {
             ),
             _ => bail!("unexpected argument {arg}\n\n{USAGE}"),
         }
+    }
+    // scan given no files asks Shield about what's stored, below.
+    let shield_scan = command == "scan" && paths.is_empty();
+    if shield_scan
+        && (model.is_some()
+            || head.is_some()
+            || threshold.is_some()
+            || ffmpeg.is_some()
+            || jobs.is_some()
+            || refused)
+    {
+        bail!("scan needs files or directories to score\n\n{USAGE}");
+    }
+    if command == "scan" && !shield_scan && (from > 0 || limit.is_some() || dry_run) {
+        bail!("--from, --limit and --dry-run are for scan given no files\n\n{USAGE}");
+    }
+    if scanning && !shield_scan {
+        // A config is read unless the encoder is given without one.
+        let config = (config_given || model.is_none())
+            .then(|| Config::load(&config_path))
+            .transpose()?;
+        let mut scan = config
+            .as_ref()
+            .map_or_else(Default::default, |c| c.scan.clone());
+        scan.model = model.or(scan.model);
+        scan.head = head.or(scan.head);
+        scan.threshold = threshold.or(scan.threshold);
+        scan.ffmpeg = ffmpeg.unwrap_or(scan.ffmpeg);
+        if command == "scan" {
+            return scan::cli::run(&scan, &paths, jobs, refused);
+        }
+        if !(0.5..1.0).contains(&catch) {
+            bail!("--catch is a share, at least 0.5 and under 1");
+        }
+        if blob_dirs.is_empty() {
+            let c = config.context("train needs --blobs DIR, or a config")?;
+            blob_dirs.push(c.data.join("blobs"));
+        }
+        let all = std::thread::available_parallelism().map_or(1, |n| n.get());
+        return scan::train::run(
+            &scan,
+            &scan::train::Options {
+                labels: labels.context("train needs --labels")?,
+                out: out.context("train needs --out, where the head goes")?,
+                blobs: blob_dirs,
+                catch,
+                c,
+                jobs: jobs.unwrap_or(all),
+                scores,
+                cache,
+            },
+        );
     }
     let targets: Vec<store::Banned> = hashes
         .iter()
@@ -151,7 +243,7 @@ fn run() -> Result<()> {
         "bans" => moderate::list(&config),
         "scan" => {
             install_crypto();
-            scan::scan_existing(&config, from, limit, dry_run)
+            scan::known::scan_existing(&config, from, limit, dry_run)
         }
         "import" => import::run(
             &config,
@@ -191,9 +283,21 @@ fn serve(config: Config) -> Result<()> {
         crate::info!("listening", "address": app.config.listen.to_string(), "public_url": app.config.public_url, "blobs": app.store.count().unwrap_or(0));
 
         let shutdown = CancellationToken::new();
+        if let Some(addr) = app.config.admin.listen {
+            let admin = tokio::net::TcpListener::bind(addr)
+                .await
+                .with_context(|| format!("Could not listen on {addr}"))?;
+            crate::info!("admin_listening", "address": addr.to_string());
+            tokio::spawn(server::serve(
+                admin,
+                move |req, peer| admin::handle(app, req, peer),
+                shutdown.clone(),
+            ));
+        }
         tokio::spawn(flush_access(app, shutdown.clone()));
+        tokio::spawn(expire_evidence(app, shutdown.clone()));
         tokio::spawn(stop_on_signal(shutdown.clone()));
-        tokio::spawn(scan::retry_unscanned(
+        tokio::spawn(scan::known::retry_unscanned(
             app,
             Duration::from_secs(app.config.scan.retry_every.max(10)),
             shutdown.clone(),
@@ -224,6 +328,23 @@ async fn flush_access(app: &'static app::App, shutdown: CancellationToken) {
             tokio::task::spawn_blocking(move || app.store.touch(&seqs, access::today())).await;
         if let Ok(Err(e)) = result {
             crate::warn!("access_flush_failed", "error": format!("{e:#}"));
+        }
+    }
+}
+
+/// Delete evidence kept its year past its report, at startup and daily.
+async fn expire_evidence(app: &'static app::App, shutdown: CancellationToken) {
+    let mut every = tokio::time::interval(Duration::from_secs(86400));
+    loop {
+        tokio::select! {
+            _ = every.tick() => {}
+            _ = shutdown.cancelled() => return,
+        }
+        let dir = app.config.evidence();
+        let result =
+            tokio::task::spawn_blocking(move || moderate::expire(&dir, upload::now())).await;
+        if let Ok(Err(e)) = result {
+            crate::warn!("evidence_expire_failed", "error": format!("{e:#}"));
         }
     }
 }

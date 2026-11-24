@@ -162,7 +162,7 @@ impl Banner<'_> {
 impl Scanner {
     pub fn open(config: &Config) -> Result<Option<Scanner>> {
         let scan = &config.scan;
-        if !scan.enabled {
+        if !scan.shield() {
             return Ok(None);
         }
         let creds_path = scan
@@ -347,7 +347,7 @@ pub async fn retry_unscanned(
     every: Duration,
     shutdown: tokio_util::sync::CancellationToken,
 ) {
-    let Some(scanner) = &app.scanner else {
+    let Some(scanner) = &app.shield else {
         return;
     };
     let mut tick = tokio::time::interval(every);
@@ -423,7 +423,8 @@ pub(crate) async fn retry_round(app: &'static App, scanner: &Scanner) -> Result<
 /// `ditto-blossom scan`: ask Shield about every image already here, from
 /// blob `from` on (the seq it last printed, to carry on).
 pub fn scan_existing(config: &Config, from: u64, limit: Option<u64>, dry_run: bool) -> Result<()> {
-    let scanner = Scanner::open(config)?.context("scan isn't enabled in the config")?;
+    let scanner = Scanner::open(config)?
+        .context("Shield isn't set up in the config: scan.enabled and credentials_file")?;
     let store: &'static Store = Box::leak(Box::new(Store::open(&config.data)?));
     let files: &'static Files = Box::leak(Box::new(Files::open(&config.data, 1, false)?));
     let runtime = tokio::runtime::Builder::new_current_thread()

@@ -138,19 +138,38 @@ fn group_digits(n: usize) -> String {
     out
 }
 
-/// Who's asking: the socket's address, or, from a trusted proxy, the first
-/// address it says it forwarded for.
+/// Who's asking: the socket's address, or, from a trusted proxy, the last
+/// address in X-Forwarded-For that isn't a trusted proxy. Proxies append to
+/// the header, so what's left of that is the client's to write.
 pub fn client_ip(app: &App, req: &Request<Incoming>, peer: SocketAddr) -> IpAddr {
-    let peer = peer.ip();
-    if !app.config.trusted_proxies.contains(&peer) {
+    let forwarded = req
+        .headers()
+        .get_all("x-forwarded-for")
+        .iter()
+        .filter_map(|v| v.to_str().ok());
+    forwarded_for(&app.config.trusted_proxies, peer.ip(), forwarded)
+}
+
+fn forwarded_for<'a>(
+    trusted: &[IpAddr],
+    peer: IpAddr,
+    headers: impl Iterator<Item = &'a str>,
+) -> IpAddr {
+    if !trusted.contains(&peer) {
         return peer;
     }
-    req.headers()
-        .get("x-forwarded-for")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.split(',').next())
-        .and_then(|ip| ip.trim().parse().ok())
-        .unwrap_or(peer)
+    let hops: Vec<&str> = headers.flat_map(|v| v.split(',')).collect();
+    let mut client = peer;
+    for hop in hops.iter().rev() {
+        let Ok(ip) = hop.trim().parse::<IpAddr>() else {
+            break;
+        };
+        client = ip;
+        if !trusted.contains(&ip) {
+            break;
+        }
+    }
+    client
 }
 
 /// The URL a blob is served at, with the extension its type gets.
@@ -178,5 +197,23 @@ mod tests {
         assert!(blob_path("/upload").is_none());
         assert_eq!(group_digits(1376705), "1,376,705");
         assert_eq!(group_digits(12), "12");
+    }
+
+    #[test]
+    fn forwarded_for_is_read_from_the_right() {
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        let trusted = [ip("127.0.0.1"), ip("10.0.0.2")];
+        let at = |peer: &str, h: &[&str]| forwarded_for(&trusted, ip(peer), h.iter().copied());
+        // Whatever a client writes first is passed over for what was appended.
+        assert_eq!(at("127.0.0.1", &["6.6.6.6, 1.2.3.4"]), ip("1.2.3.4"));
+        assert_eq!(
+            at("127.0.0.1", &["6.6.6.6", "1.2.3.4, 10.0.0.2"]),
+            ip("1.2.3.4")
+        );
+        assert_eq!(at("127.0.0.1", &["junk, 1.2.3.4"]), ip("1.2.3.4"));
+        assert_eq!(at("127.0.0.1", &[]), ip("127.0.0.1"));
+        assert_eq!(at("127.0.0.1", &["10.0.0.2"]), ip("10.0.0.2"));
+        // Not from a proxy: the header counts for nothing.
+        assert_eq!(at("5.5.5.5", &["1.2.3.4"]), ip("5.5.5.5"));
     }
 }

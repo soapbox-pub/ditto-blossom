@@ -151,6 +151,39 @@ async fn sandboxes_blobs_opened_as_pages() {
 }
 
 #[tokio::test]
+async fn sandboxes_what_could_be_a_page() {
+    let s = start("").await;
+    let c = client();
+    let csp = |ty: &'static str, data: &'static [u8]| {
+        let h = put(s.app, data, Some(ty));
+        let r = c.get(format!("{}/{}", s.url, h.hex())).send();
+        async move {
+            let r = r.await.unwrap();
+            assert_eq!(r.status(), StatusCode::OK, "{ty}");
+            assert_eq!(r.headers()["content-type"], ty);
+            r.headers()
+                .get("content-security-policy")
+                .map(|v| v.to_str().unwrap().to_string())
+        }
+    };
+    for (ty, data) in [
+        ("text/html", &b"<script>alert(1)</script>"[..]),
+        (
+            "image/svg+xml",
+            b"<svg xmlns=\"http://www.w3.org/2000/svg\"/>",
+        ),
+        (
+            "application/xhtml+xml",
+            b"<html xmlns=\"http://www.w3.org/1999/xhtml\"/>",
+        ),
+        ("image/png", b"\x89PNG\r\n\x1a\n"),
+    ] {
+        assert_eq!(csp(ty, data).await.as_deref(), Some("sandbox"), "{ty}");
+    }
+    assert_eq!(csp("application/pdf", b"%PDF-1.7\n").await, None);
+}
+
+#[tokio::test]
 async fn head_conditional_ranges_and_errors() {
     let s = start("").await;
     let data: Vec<u8> = (0..50_000u32).map(|i| i as u8).collect();
@@ -232,5 +265,7 @@ async fn head_conditional_ranges_and_errors() {
     assert_eq!(r.headers()["content-type"], "image/jpeg");
 }
 
+mod admin;
 mod scan;
+mod scanning;
 mod writes;

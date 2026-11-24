@@ -13,7 +13,7 @@ data = "/var/lib/ditto-blossom"
 public_url = "https://blossom.example.com"
 
 # Peers whose X-Forwarded-For is believed (rate limits and logs use the
-# client's address).
+# client's address): the last address in it that isn't one of these.
 trusted_proxies = ["127.0.0.1", "::1"]
 
 # Blob files kept mapped and open.
@@ -45,14 +45,17 @@ allow_private = false
 [report]
 enabled = true
 
-# Matching new images against known CSAM with Arachnid Shield
-# (https://projectarachnid.ca/en/#shield, free for service providers). Only
-# PDQ hashes, computed here, are sent to it. See the README's "Scanning".
+# Scanning new uploads and mirrors (see the README), on when enabled, by
+# whichever of these is set up.
 [scan]
 enabled = false
+
+# Matching images against known CSAM with Arachnid Shield
+# (https://projectarachnid.ca/en/#shield, free for service providers). Only
+# PDQ hashes, computed here, are sent to it. See the README's "Scanning".
 shield_url = "https://shield.projectarachnid.com"
 # username:password from the Shield account page; readable by the server
-# alone.
+# alone. Unset: no Shield.
 # credentials_file = "/etc/ditto-blossom/shield"
 # A directory per match: its blobs and record.json, for the NCMEC report.
 # evidence = "/var/lib/ditto-blossom/scan-matches"
@@ -60,3 +63,28 @@ shield_url = "https://shield.projectarachnid.com"
 # alert_command = ["/usr/local/bin/alert-csam"]
 # Seconds between tries at blobs kept while Shield couldn't be asked.
 retry_every = 300
+
+# Refusing explicit images and video (see the README's "Refusing explicit
+# media"): an encoder made by contrib/clip-model.py and a head made by
+# `ditto-blossom train`. Unset model and head: no refusing.
+# model = "/var/lib/ditto-blossom/clip-b32.onnx"
+# head = "/var/lib/ditto-blossom/head.json"
+# threshold = 0.16       # unset: the one training chose
+# workers = 2            # each ~8 images/s on a core; ~380 MB for them all
+ffmpeg = "ffmpeg"        # video, AVIF, HEIC, JPEG XL; "" passes them unscanned
+refuse_undecodable = true
+require_sandbox = false  # true: don't start unless ffmpeg's files and network are shut off
+background = false       # store at once and scan after; refused blobs are taken out
+hold = true              # with background: don't serve a blob until it's scanned
+
+# The admin dashboard (see the README), on a listener of its own. Unset
+# `listen`: there's none. Reach it by SSH tunnel, or proxy a host name of its
+# own to it over https; the README says what that's safe against.
+[admin]
+# listen = "127.0.0.1:3001"
+# url = "https://admin.example.com"   # where admins open it; http:// and listen if unset
+# pubkeys = []           # hex pubkeys that may sign in
+# preserve = "/var/lib/ditto-blossom/evidence"   # where Ban as CSAM keeps evidence (this, by default)
+# cdn = "Cloudflare"     # the cache in front of public_url, if any: what to purge from it
+# labels = "/var/lib/ditto-blossom/labels.json"     # train --labels, added to
+# embeddings = "/var/lib/ditto-blossom/embeddings.jsonl"  # train --cache, added to

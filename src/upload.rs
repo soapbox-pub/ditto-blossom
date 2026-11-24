@@ -17,7 +17,7 @@ use crate::hash::Hash;
 use crate::http::{self, error};
 use crate::ingest;
 use crate::routes::{blob_url, client_ip};
-use crate::scan::{Banner, Checked, Match, Source};
+use crate::scan::known::{Banner, Checked, Match, Source};
 use crate::server::Body;
 use crate::store::Record;
 use crate::writer::{Deleted, Refused};
@@ -166,26 +166,135 @@ pub async fn upload(app: &'static App, req: Request<Incoming>, peer: SocketAddr)
     store(app, blob, token.map(|t| t.pubkey), ip, "upload").await
 }
 
+const REFUSED: &str = "Explicit images and video aren't accepted here";
+
+/// Stored unscanned (`scan.background`) while fewer than this wait for a
+/// scan; past it, uploads are scanned before they're stored, so a flood
+/// can't put off scanning what's served meanwhile.
+const BACKLOG: usize = 1000;
+
+/// Scan a received blob, if scanning is on: a refusal, or `None` to keep it.
+/// A blob a scan refused before is banned, so it's refused without a look.
+/// `ip` is who sent it: each address has a few scans at a time.
+pub async fn screen(
+    app: &'static App,
+    blob: &mut crate::writer::Ingested,
+    how: &str,
+    ip: std::net::IpAddr,
+) -> Option<Response<Body>> {
+    let scanner = app.scanner.as_ref()?;
+    if let Some(r) = refuse_banned(app, Some(&blob.hash), None) {
+        return Some(r);
+    }
+    // Stored already, so served already: scanning it again changes nothing.
+    if let Ok(Some(_)) = app.store.find(&blob.hash, false) {
+        return None;
+    }
+    // No kind of media, nor a page or PDF to show any: nothing to judge,
+    // and no reason to wait behind what there is.
+    let head = match &blob.body {
+        crate::writer::IngestedBody::Inline(v) => v[..v.len().min(crate::scan::HEAD)].to_vec(),
+        crate::writer::IngestedBody::File(t) => match read_head(t.path()).await {
+            Ok(h) => h,
+            Err(e) => {
+                crate::error!("scan_head_failed", "blob": blob.hash.hex(), "error": e.to_string());
+                return Some(error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "The upload couldn't be read back",
+                ));
+            }
+        },
+    };
+    if !crate::scan::needs_worker(&head, blob.mime.as_deref()) {
+        return None;
+    }
+    if app.config.scan.background && scanner.pending() < BACKLOG {
+        blob.unscanned = true;
+        return None;
+    }
+    let Some(_turn) = scanner.turns.take(ip) else {
+        let mut r = error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "Too many of your uploads being checked at once; try again shortly",
+        );
+        r.headers_mut().insert(
+            header::RETRY_AFTER,
+            hyper::header::HeaderValue::from_static("2"),
+        );
+        return Some(r);
+    };
+    let input = match &blob.body {
+        crate::writer::IngestedBody::Inline(v) => crate::scan::Input::Bytes(v.as_slice().into()),
+        crate::writer::IngestedBody::File(t) => crate::scan::Input::File(t.path().to_path_buf()),
+    };
+    let Ok(verdict) = scanner.check(input, blob.mime.as_deref()).await else {
+        return Some(error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Too many uploads being checked; try again shortly",
+        ));
+    };
+    let refused = verdict.refused(scanner.rule);
+    if refused || matches!(verdict.outcome, crate::scan::Outcome::Undecodable(_)) {
+        crate::info!(
+            if refused { "refused" } else { "unscanned" },
+            "via": how, "blob": blob.hash.hex(), "size": blob.size, "type": verdict.ty,
+            "score": verdict.score(), "outcome": format!("{:?}", verdict.outcome),
+            "ms": verdict.millis.round(),
+        );
+    }
+    if !refused {
+        return None;
+    }
+    if let Some(s) = verdict.score() {
+        if let Err(e) = app.writer.refuse(blob.hash, s).await {
+            crate::error!("refuse_record_failed", "blob": blob.hash.hex(), "error": format!("{e:#}"));
+        }
+        Some(error(StatusCode::FORBIDDEN, REFUSED))
+    } else {
+        Some(error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "What it shows couldn't all be read to be checked",
+        ))
+    }
+}
+
+/// A file's first `scan::HEAD` bytes, or all of it if it's shorter.
+async fn read_head(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
+    use tokio::io::AsyncReadExt;
+    let mut f = tokio::fs::File::open(path).await?;
+    let mut head = vec![0; crate::scan::HEAD];
+    let mut n = 0;
+    while n < head.len() {
+        match f.read(&mut head[n..]).await? {
+            0 => break,
+            k => n += k,
+        }
+    }
+    head.truncate(n);
+    Ok(head)
+}
+
 /// Keep an ingested blob and answer with its descriptor: 201 if it's new,
 /// 200 if it was here (BUD-02, BUD-04). A new image is checked against
-/// known CSAM first, if `scan` is enabled, and a match isn't kept.
+/// known CSAM first, if Shield is set up, and a match isn't kept; then, if
+/// explicit media is refused, it's scanned for that (see `screen`).
 pub async fn store(
     app: &'static App,
-    blob: crate::writer::Ingested,
+    mut blob: crate::writer::Ingested,
     owner: Option<[u8; 32]>,
     ip: IpAddr,
     how: &str,
 ) -> Response<Body> {
     let (hash, size) = (blob.hash, blob.size);
-    let mut unscanned = false;
-    if let Some(scanner) = &app.scanner
+    let mut unasked = false;
+    if let Some(scanner) = &app.shield
         && !matches!(app.store.find(&hash, false), Ok(Some(_)))
     {
         match scanner.check(&blob).await {
             Checked::Skipped | Checked::Clean => {}
             Checked::Unchecked(e) => {
                 crate::warn!("scan_deferred", "blob": hash.hex(), "error": e);
-                unscanned = true;
+                unasked = true;
             }
             Checked::Matched(pdq, verdict) => {
                 let source = Source::of_ingested(&blob);
@@ -210,11 +319,18 @@ pub async fn store(
             }
         }
     }
-    match app.writer.insert(blob, owner, now(), unscanned).await {
+    if let Some(refusal) = screen(app, &mut blob, how, ip).await {
+        return refusal;
+    }
+    let unscanned = blob.unscanned;
+    match app.writer.insert(blob, owner, now(), unasked).await {
         Ok(stored) => {
             if stored.created {
-                crate::info!("stored", "via": how, "blob": hash.hex(), "size": size, "type": stored.record.mime, "owner": owner.map(hex::encode), "ip": ip.to_string(), "unscanned": unscanned);
+                crate::info!("stored", "via": how, "blob": hash.hex(), "size": size, "type": stored.record.mime, "owner": owner.map(hex::encode), "ip": ip.to_string(), "unasked": unasked, "unscanned": unscanned);
                 app.compressor.offer(&stored.record);
+                if unscanned && let Some(s) = &app.scanner {
+                    s.later(hash);
+                }
             }
             let status = if stored.created {
                 StatusCode::CREATED

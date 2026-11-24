@@ -491,6 +491,18 @@ async fn bans_keep_blobs_and_uploaders_out() {
         upload(&good, &kept).send().await.unwrap().status(),
         StatusCode::CREATED
     );
+    // One both uploaded.
+    let shared = b"a blob they both have".to_vec();
+    for kp in [&good, &bad] {
+        assert!(
+            upload(kp, &shared)
+                .send()
+                .await
+                .unwrap()
+                .status()
+                .is_success()
+        );
+    }
 
     let kept_copies = tempfile::tempdir().unwrap();
     crate::moderate::ban_in(
@@ -501,11 +513,39 @@ async fn bans_keep_blobs_and_uploaders_out() {
         Some(kept_copies.path()),
     )
     .unwrap();
-    // Preserved first, inline and file alike.
+    // Preserved first, inline and file alike, readable only by their owner,
+    // each with who owned it and why it went.
     for data in [&small, &large] {
-        let copy = std::fs::read(kept_copies.path().join(Hash::of(data).hex())).unwrap();
-        assert_eq!(&copy, data);
+        use std::os::unix::fs::PermissionsExt;
+        let h = Hash::of(data).hex();
+        let path = kept_copies.path().join(&h);
+        assert_eq!(&std::fs::read(&path).unwrap(), data);
+        assert_eq!(path.metadata().unwrap().permissions().mode() & 0o777, 0o600);
+        let json = kept_copies.path().join(format!("{h}.json"));
+        assert_eq!(json.metadata().unwrap().permissions().mode() & 0o777, 0o600);
+        let meta: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(json).unwrap()).unwrap();
+        assert_eq!(meta["sha256"], h);
+        assert_eq!(meta["size"], data.len());
+        assert_eq!(meta["owners"], serde_json::json!([hex::encode(pk(&bad))]));
+        assert_eq!(meta["reason"], "uploader banned: csam");
     }
+    // A blob someone else owns too stays theirs: kept as context, naming only
+    // the banned uploader, and not banned.
+    let h = Hash::of(&shared);
+    let meta: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(kept_copies.path().join(format!("{}.json", h.hex()))).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(meta["owners"], serde_json::json!([hex::encode(pk(&bad))]));
+    assert_eq!(get(h).await.unwrap().status(), StatusCode::OK);
+    s.app
+        .store
+        .read(|txn| {
+            let seq = s.app.store.seq_of(txn, &h).unwrap().unwrap();
+            assert_eq!(s.app.store.owners_of(txn, seq).unwrap(), [pk(&good)]);
+        })
+        .unwrap();
 
     // Its blobs are gone, files and all, and banned; others' aren't.
     for data in [&small, &large] {

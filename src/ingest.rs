@@ -130,6 +130,7 @@ pub async fn ingest(
         .or_else(|| mime::sniff(&head));
     match spill {
         None => Ok(Ingested {
+            unscanned: false,
             hash: Hash::of(&head),
             size,
             mime,
@@ -142,6 +143,7 @@ pub async fn ingest(
                 .map_err(|e| Error::Disk(io::Error::other(e)))?
                 .map_err(Error::Disk)?;
             Ok(Ingested {
+                unscanned: false,
                 hash,
                 size,
                 mime,

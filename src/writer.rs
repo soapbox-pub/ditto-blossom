@@ -15,10 +15,20 @@ use tokio::sync::oneshot;
 
 use crate::blobs::{Files, TempFile};
 use crate::hash::Hash;
-use crate::store::{Banned, INLINE_MAX, Record, Store, flag};
+use crate::store::{Ban, Banned, INLINE_MAX, Record, Store, flag};
 
 /// The most jobs one commit takes.
 const MAX_BATCH: usize = 256;
+
+/// The ban a scan's refusal is kept as: the same as an operator's, lifted
+/// the same way (`ditto-blossom unban`).
+fn scan_ban(hash: Hash, score: f32) -> Ban {
+    Ban {
+        target: Banned::Blob(hash),
+        at: crate::upload::now(),
+        reason: format!("scan: scored {score:.3}"),
+    }
+}
 
 /// A received blob, hashed and (unless small) written to a temp file.
 pub struct Ingested {
@@ -26,6 +36,8 @@ pub struct Ingested {
     pub size: u64,
     pub mime: Option<String>,
     pub body: IngestedBody,
+    /// To be stored now and scanned after.
+    pub unscanned: bool,
 }
 
 pub enum IngestedBody {
@@ -82,6 +94,10 @@ enum Job {
     AddOwner(Hash, [u8; 32], oneshot::Sender<Result<Option<Record>>>),
     Delete(Hash, [u8; 32], oneshot::Sender<Result<Deleted>>),
     Brotli(u64, Hash, BrotliCopy),
+    /// A background scan's result: refused (with its score, if it had one).
+    Scanned(u64, Hash, Option<Option<f32>>),
+    /// An upload refused before it was stored.
+    Refuse(Hash, f32, oneshot::Sender<Result<()>>),
     Report(Vec<Hash>, [u8; 32], Vec<u8>, oneshot::Sender<Result<()>>),
     Ban(BanJob, oneshot::Sender<Result<Vec<Hash>>>),
     Unqueue(Hash),
@@ -92,7 +108,7 @@ struct Insert {
     owner: Option<[u8; 32]>,
     now: u64,
     /// Kept without Shield's say: queue it to be asked again.
-    unscanned: bool,
+    unasked: bool,
 }
 
 #[derive(Clone)]
@@ -120,19 +136,19 @@ impl Writer {
     }
 
     /// Keep a blob, owned by `owner` if given, uploaded `now`; if
-    /// `unscanned`, queued for Shield.
+    /// `unasked`, queued for Shield.
     pub async fn insert(
         &self,
         blob: Ingested,
         owner: Option<[u8; 32]>,
         now: u64,
-        unscanned: bool,
+        unasked: bool,
     ) -> Result<Stored> {
         let job = Insert {
             blob,
             owner,
             now,
-            unscanned,
+            unasked,
         };
         self.ask(|r| Job::Insert(job, r)).await
     }
@@ -160,6 +176,19 @@ impl Writer {
         self.ask(|r| Job::Report(hashes, event_id, json, r)).await
     }
 
+    /// Record a blob scanned after it was stored: take it out if it was
+    /// refused (`Some`, with its score if it had one, which bans its hash),
+    /// else serve it. Nobody waits on it.
+    pub fn scanned(&self, seq: u64, hash: Hash, refused: Option<Option<f32>>) {
+        let _ = self.tx.send(Job::Scanned(seq, hash, refused));
+    }
+
+    /// Ban a hash a scan refused, by the score it was refused at, so it's
+    /// refused from its hash alone by the time the refusal is answered.
+    pub async fn refuse(&self, hash: Hash, score: f32) -> Result<()> {
+        self.ask(|r| Job::Refuse(hash, score, r)).await
+    }
+
     /// Record a brotli copy; nobody waits on it.
     pub fn brotli(&self, seq: u64, hash: Hash, copy: BrotliCopy) {
         let _ = self.tx.send(Job::Brotli(seq, hash, copy));
@@ -176,6 +205,7 @@ enum Reply {
     Delete(oneshot::Sender<Result<Deleted>>, Result<Deleted>),
     Report(oneshot::Sender<Result<()>>, Result<()>),
     Ban(oneshot::Sender<Result<Vec<Hash>>>, Result<Vec<Hash>>),
+    Refuse(oneshot::Sender<Result<()>>, Result<()>),
 }
 
 fn run(store: &'static Store, files: &'static Files, rx: mpsc::Receiver<Job>) {
@@ -269,6 +299,39 @@ fn batch(store: &'static Store, files: &'static Files, jobs: Vec<Job>) {
                 })();
                 replies.push(Reply::Delete(reply, r));
             }
+            Job::Scanned(seq, hash, refused) => {
+                let r = (|| -> Result<()> {
+                    // Deleted, or the seq reused, while it was scanned.
+                    let Some(mut rec) = store.record(&txn, seq)? else {
+                        return Ok(());
+                    };
+                    if rec.hash != hash {
+                        return Ok(());
+                    }
+                    if let Some(score) = refused {
+                        // A score is a judgement; an unreadable blob may
+                        // read next time, so isn't banned.
+                        if let Some(s) = score {
+                            store.ban(&mut txn, &scan_ban(hash, s))?;
+                        }
+                        store.remove(&mut txn, seq, &rec)?;
+                        if !rec.has(flag::INLINE) || rec.br_size as usize > INLINE_MAX {
+                            unlink.push((seq, hash));
+                        }
+                    } else {
+                        rec.flags &= !flag::UNSCANNED;
+                        store.update(&mut txn, seq, &rec)?;
+                    }
+                    Ok(())
+                })();
+                if let Err(e) = r {
+                    crate::error!("scan_record_failed", "blob": hash.hex(), "error": format!("{e:#}"));
+                }
+            }
+            Job::Refuse(hash, score, reply) => {
+                let r = store.ban(&mut txn, &scan_ban(hash, score));
+                replies.push(Reply::Refuse(reply, r));
+            }
             Job::Brotli(seq, hash, copy) => {
                 if let Err(e) = brotli(store, files, &mut txn, seq, hash, copy, &mut placed) {
                     crate::warn!("brotli_store_failed", "blob": hash.hex(), "error": format!("{e:#}"));
@@ -321,6 +384,7 @@ fn batch(store: &'static Store, files: &'static Files, jobs: Vec<Job>) {
             Reply::Delete(tx, r) => drop(tx.send(settle(r, &failed))),
             Reply::Report(tx, r) => drop(tx.send(settle(r, &failed))),
             Reply::Ban(tx, r) => drop(tx.send(settle(r, &failed))),
+            Reply::Refuse(tx, r) => drop(tx.send(settle(r, &failed))),
         }
     }
 }
@@ -337,7 +401,7 @@ fn insert(
         blob,
         owner,
         now,
-        unscanned,
+        unasked,
     } = job;
     if store.banned(txn, Some(&blob.hash), owner.as_ref())? {
         return Err(Refused.into());
@@ -360,7 +424,8 @@ fn insert(
         size: blob.size,
         uploaded: now,
         mime: blob.mime,
-        flags: if inline { flag::INLINE } else { 0 },
+        flags: if inline { flag::INLINE } else { 0 }
+            | if blob.unscanned { flag::UNSCANNED } else { 0 },
         br_size: 0,
     };
     let seq = store.next_seq(txn)?;
@@ -377,7 +442,7 @@ fn insert(
     if let Some(pk) = owner {
         store.add_owner(txn, seq, record.uploaded, &pk)?;
     }
-    if unscanned {
+    if unasked {
         store.queue_unscanned(txn, &record.hash, now)?;
     }
     Ok(Stored {
@@ -425,9 +490,9 @@ fn fail_all(jobs: Vec<Job>, e: &anyhow::Error) {
             Job::Insert(.., r) => drop(r.send(Err(err))),
             Job::AddOwner(.., r) => drop(r.send(Err(err))),
             Job::Delete(.., r) => drop(r.send(Err(err))),
-            Job::Report(.., r) => drop(r.send(Err(err))),
+            Job::Report(.., r) | Job::Refuse(.., r) => drop(r.send(Err(err))),
             Job::Ban(_, r) => drop(r.send(Err(err))),
-            Job::Brotli(..) | Job::Unqueue(_) => {}
+            Job::Brotli(..) | Job::Scanned(..) | Job::Unqueue(_) => {}
         }
     }
 }

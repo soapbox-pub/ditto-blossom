@@ -99,6 +99,11 @@ struct Setup {
 }
 
 async fn setup(extra: &str) -> Setup {
+    setup_scanning(extra, "").await
+}
+
+/// `setup`, with `scan` added to its `[scan]`.
+async fn setup_scanning(extra: &str, scan: &str) -> Setup {
     let shield = mock().await;
     shield.bad.lock().unwrap().insert(pdq_of(BAD));
     let etc = tempfile::tempdir().unwrap();
@@ -108,7 +113,7 @@ async fn setup(extra: &str) -> Setup {
     let evidence = tempfile::tempdir().unwrap();
     let s = start(&format!(
         "{extra}\n[scan]\nenabled = true\nshield_url = {:?}\ncredentials_file = {:?}\nevidence = {:?}\n\
-         alert_command = [\"sh\", \"-c\", \"cat >> {}\"]\n",
+         alert_command = [\"sh\", \"-c\", \"cat >> {}\"]\n{scan}",
         shield.url,
         creds.to_str().unwrap(),
         evidence.path().to_str().unwrap(),
@@ -269,12 +274,18 @@ async fn an_outage_keeps_uploads_and_asks_again() {
     assert_eq!(s.app.store.unscanned(10).unwrap(), vec![Hash::of(BAD)]);
 
     // Still down: it stays queued.
-    let scanner = s.app.scanner.as_ref().unwrap();
-    assert!(crate::scan::retry_round(s.app, scanner).await.is_err());
+    let scanner = s.app.shield.as_ref().unwrap();
+    assert!(
+        crate::scan::known::retry_round(s.app, scanner)
+            .await
+            .is_err()
+    );
     assert_eq!(s.app.store.unscanned(10).unwrap().len(), 1);
 
     t.shield.down.store(false, Ordering::SeqCst);
-    crate::scan::retry_round(s.app, scanner).await.unwrap();
+    crate::scan::known::retry_round(s.app, scanner)
+        .await
+        .unwrap();
     assert!(s.app.store.unscanned(10).unwrap().is_empty());
     let r = c
         .get(format!("{}/{}", s.url, Hash::of(BAD).hex()))
@@ -308,7 +319,9 @@ async fn an_outage_keeps_uploads_and_asks_again() {
         .unwrap();
     assert_eq!(r.status(), StatusCode::CREATED);
     t.shield.down.store(false, Ordering::SeqCst);
-    crate::scan::retry_round(s.app, scanner).await.unwrap();
+    crate::scan::known::retry_round(s.app, scanner)
+        .await
+        .unwrap();
     assert!(s.app.store.unscanned(10).unwrap().is_empty());
     let r = c
         .get(format!("{}/{}", s.url, Hash::of(&clean).hex()))
@@ -340,4 +353,66 @@ async fn exempt_keys_lose_the_blob_but_not_the_key() {
     let bans = s.app.store.bans().unwrap();
     assert_eq!(bans.len(), 1);
     assert_eq!(bans[0].target, Banned::Blob(Hash::of(BAD)));
+}
+
+#[tokio::test]
+async fn shield_is_asked_before_explicit_media_is_refused() {
+    let red = |seed: u32| {
+        let img = image::RgbImage::from_fn(64, 64, |x, y| {
+            image::Rgb([255, ((x * seed + y * 7) % 64) as u8, 0])
+        });
+        let mut out = Vec::new();
+        image::DynamicImage::ImageRgb8(img)
+            .write_to(&mut Cursor::new(&mut out), image::ImageFormat::Png)
+            .unwrap();
+        out
+    };
+    let (matched, explicit) = (red(3), red(5));
+    let t = setup_scanning("", "model = \"test:red\"\nthreshold = 0.5\n").await;
+    t.shield.bad.lock().unwrap().insert(pdq_of(&matched));
+    let (s, c) = (&t.s, client());
+    let kp = keypair();
+    let upload = |data: &[u8]| {
+        c.put(format!("{}/upload", s.url))
+            .header("authorization", auth(&kp, &[Hash::of(data)]))
+            .body(data.to_vec())
+            .send()
+    };
+
+    // Explicit and known: dealt with as CSAM, not merely refused.
+    assert_eq!(
+        upload(&matched).await.unwrap().status(),
+        StatusCode::FORBIDDEN
+    );
+    let (dir, _) = incident(t.evidence.path());
+    assert!(dir.join("blobs").join(Hash::of(&matched).hex()).exists());
+    let ban = s
+        .app
+        .store
+        .read(|txn| s.app.store.ban_of(txn, Banned::Blob(Hash::of(&matched))))
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(ban.reason.starts_with("CSAM"), "{}", ban.reason);
+
+    // Explicit only: refused by its score, with no incident. (The uploader
+    // is banned by now, so another key sends it.)
+    let other = keypair();
+    let r = c
+        .put(format!("{}/upload", s.url))
+        .header("authorization", auth(&other, &[Hash::of(&explicit)]))
+        .body(explicit.clone())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::FORBIDDEN);
+    assert_eq!(incidents(t.evidence.path()).len(), 1);
+    let ban = s
+        .app
+        .store
+        .read(|txn| s.app.store.ban_of(txn, Banned::Blob(Hash::of(&explicit))))
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(ban.reason.starts_with("scan"), "{}", ban.reason);
 }
