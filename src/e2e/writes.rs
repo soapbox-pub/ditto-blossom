@@ -402,6 +402,69 @@ async fn exempt_keys_skip_size_and_rate_limits() {
 }
 
 #[tokio::test]
+async fn bytes_an_hour_are_limited() {
+    let (vip, other) = (keypair(), keypair());
+    let vip_hex = hex::encode(vip.x_only_public_key().0.to_byte_array());
+    let s = start(&format!(
+        "[mirror]\nallow_private = true\n\
+         [upload]\nbytes_per_hour = 10000\nexempt = [\"{vip_hex}\"]\n"
+    ))
+    .await;
+    let c = client();
+    let upload = |kp: &secp256k1::Keypair, data: &[u8]| {
+        c.put(format!("{}/upload", s.url))
+            .header("authorization", auth(kp, "upload", &[Hash::of(data)]))
+            .body(data.to_vec())
+            .send()
+    };
+    let blob = |n: u8, len: usize| vec![n; len];
+
+    assert_eq!(
+        upload(&other, &blob(1, 6000)).await.unwrap().status(),
+        StatusCode::CREATED
+    );
+    // 4000 left: this doesn't fit.
+    let r = upload(&other, &blob(2, 6000)).await.unwrap();
+    assert_eq!(r.status(), StatusCode::TOO_MANY_REQUESTS);
+    let retry: u64 = r.headers()["retry-after"]
+        .to_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!((700..=720).contains(&retry), "{retry}");
+    // Something already here, named by X-SHA-256, costs nothing.
+    let here = blob(1, 6000);
+    let r = c
+        .put(format!("{}/upload", s.url))
+        .header("authorization", auth(&other, "upload", &[Hash::of(&here)]))
+        .header("x-sha-256", Hash::of(&here).hex())
+        .body(here.clone())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    assert_eq!(
+        upload(&other, &blob(3, 4000)).await.unwrap().status(),
+        StatusCode::CREATED
+    );
+    // Mirrors draw on the same allowance.
+    let h = put(s.app, &blob(4, 100), None);
+    let r = c
+        .put(format!("{}/mirror", s.url))
+        .header("authorization", auth(&other, "upload", &[h]))
+        .body(serde_json::json!({ "url": format!("{}/{}", s.url, h.hex()) }).to_string())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::TOO_MANY_REQUESTS);
+    // Exempt keys don't count bytes.
+    assert_eq!(
+        upload(&vip, &blob(5, 20000)).await.unwrap().status(),
+        StatusCode::CREATED
+    );
+}
+
+#[tokio::test]
 async fn bans_keep_blobs_and_uploaders_out() {
     use crate::store::Banned;
 

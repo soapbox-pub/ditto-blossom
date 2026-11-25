@@ -53,8 +53,12 @@ pub struct Upload {
     /// Uploads (and mirrors) a client may start a minute.
     #[serde(default = "default_per_minute")]
     pub per_minute: u32,
-    /// Pubkeys, hex, whose uploads and mirrors skip `max_size` and
-    /// `per_minute`, when their auth token is good.
+    /// Bytes a client may upload and mirror an hour. A blob larger than
+    /// this needs the hour's whole allowance, and uses up the next ones.
+    #[serde(default = "default_bytes_per_hour")]
+    pub bytes_per_hour: u64,
+    /// Pubkeys, hex, whose uploads and mirrors skip `max_size`,
+    /// `per_minute` and `bytes_per_hour`, when their auth token is good.
     #[serde(default, deserialize_with = "pubkeys")]
     pub exempt: HashSet<[u8; 32]>,
 }
@@ -117,6 +121,9 @@ fn default_max_size() -> u64 {
 fn default_per_minute() -> u32 {
     60
 }
+fn default_bytes_per_hour() -> u64 {
+    1 << 30
+}
 fn yes() -> bool {
     true
 }
@@ -127,6 +134,7 @@ impl Default for Upload {
             require_auth: true,
             max_size: default_max_size(),
             per_minute: default_per_minute(),
+            bytes_per_hour: default_bytes_per_hour(),
             exempt: HashSet::new(),
         }
     }

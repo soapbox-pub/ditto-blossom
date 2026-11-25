@@ -23,6 +23,8 @@ pub struct App {
     pub writer: Writer,
     pub auth: Verifier,
     pub upload_limit: RateLimit,
+    /// Bytes uploaded and mirrored.
+    pub upload_bytes: RateLimit,
     /// Uploads and mirrors receiving at once: each holds a blocking thread.
     pub receiving: tokio::sync::Semaphore,
     pub compressor: Compressor,
@@ -51,6 +53,27 @@ impl App {
         self.exempt(token) || self.upload_limit.allow(ip)
     }
 
+    /// Take `bytes` from a client's hourly allowance, or say how long until
+    /// it may. Exempt keys always may, and take nothing.
+    pub fn allow_bytes(
+        &self,
+        token: Option<&Token>,
+        ip: std::net::IpAddr,
+        bytes: u64,
+    ) -> Result<(), std::time::Duration> {
+        if self.exempt(token) {
+            return Ok(());
+        }
+        self.upload_bytes.take(ip, bytes)
+    }
+
+    /// Take `bytes` from a client's allowance whatever's left in it.
+    pub fn charge_bytes(&self, token: Option<&Token>, ip: std::net::IpAddr, bytes: u64) {
+        if !self.exempt(token) {
+            self.upload_bytes.charge(ip, bytes);
+        }
+    }
+
     /// Open everything under the config's data directory and start the
     /// writer and compressor threads. Leaked: it lives as long as the
     /// process, and requests borrow it for good.
@@ -69,7 +92,11 @@ impl App {
         let http = crate::mirror::client(config.mirror.allow_private);
         Ok(Box::leak(Box::new(App {
             auth: Verifier::new(config.domain()?),
-            upload_limit: RateLimit::new(config.upload.per_minute),
+            upload_limit: RateLimit::per_minute(config.upload.per_minute),
+            upload_bytes: RateLimit::new(
+                config.upload.bytes_per_hour,
+                std::time::Duration::from_secs(3600),
+            ),
             receiving: tokio::sync::Semaphore::new(MAX_RECEIVING),
             config,
             store,

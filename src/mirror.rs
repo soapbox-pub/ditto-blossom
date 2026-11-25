@@ -73,7 +73,8 @@ pub async fn mirror(app: &'static App, req: Request<Incoming>, peer: SocketAddr)
     if let Some(r) = crate::upload::refuse_banned(app, named.as_ref(), token.as_ref()) {
         return r;
     }
-    if !app.allow_upload(token.as_ref(), client_ip(app, &req, peer)) {
+    let ip = client_ip(app, &req, peer);
+    if !app.allow_upload(token.as_ref(), ip) {
         return error(
             StatusCode::TOO_MANY_REQUESTS,
             "Too many uploads; try again in a minute",
@@ -128,6 +129,11 @@ pub async fn mirror(app: &'static App, req: Request<Incoming>, peer: SocketAddr)
     if length.is_some_and(|l| l > max_size) {
         return error(StatusCode::PAYLOAD_TOO_LARGE, "The blob is too large");
     }
+    // With no Content-Length, it's charged once it's here; until then the
+    // client needs only to be out of debt.
+    if let Err(wait) = app.allow_bytes(token.as_ref(), ip, length.unwrap_or(0)) {
+        return crate::upload::too_much(wait, "mirror");
+    }
     let declared_type = response
         .headers()
         .get(reqwest::header::CONTENT_TYPE)
@@ -145,6 +151,9 @@ pub async fn mirror(app: &'static App, req: Request<Incoming>, peer: SocketAddr)
         Ok(b) => b,
         Err(e) => return ingest_error(e),
     };
+    if length.is_none() {
+        app.charge_bytes(token.as_ref(), ip, blob.size);
+    }
     // A mirror must name what it fetches (BUD-04, BUD-11): the URL alone
     // says nothing trustworthy about the bytes.
     if let Some(t) = &token

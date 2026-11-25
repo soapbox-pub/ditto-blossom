@@ -70,9 +70,16 @@ unit to match. Logs are one JSON object per line on stdout.
 
 ### Limits, and who skips them
 
-`[upload] max_size` caps a blob's size, and `per_minute` the uploads and
-mirrors one address (one /64 for IPv6) may start a minute. Pubkeys in
-`exempt`, hex, skip both when they sign the request's auth token:
+`[upload] max_size` caps a blob's size, `per_minute` the uploads and
+mirrors one address (one /64 for IPv6) may start a minute, and
+`bytes_per_hour` how much they may bring in an hour (1 GiB unless set). An
+upload is counted by its Content-Length before it's read, a mirror by the
+other server's Content-Length, or by what arrived if it sent none; blobs
+already here and named by `X-SHA-256` cost nothing. A blob larger than the
+hour's allowance goes through only when none of it is spent, and uses up
+the hours after it. Past the allowance, clients get 429 with
+`Retry-After`. Pubkeys in `exempt`, hex, skip all three when they sign the
+request's auth token:
 
 ```toml
 [upload]

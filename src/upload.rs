@@ -128,6 +128,9 @@ pub async fn upload(app: &'static App, req: Request<Incoming>, peer: SocketAddr)
             return http::json(StatusCode::OK, &descriptor(app, &rec));
         }
     }
+    if let Err(wait) = app.allow_bytes(token.as_ref(), ip, length) {
+        return too_much(wait, "upload");
+    }
     let Ok(_receiving) = app.receiving.try_acquire() else {
         return error(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -196,6 +199,21 @@ pub async fn store(
             )
         }
     }
+}
+
+/// A 429 for a client past its hourly bytes, with when to come back.
+pub fn too_much(wait: std::time::Duration, how: &str) -> Response<Body> {
+    let secs = wait.as_secs().max(1);
+    crate::info!("limited_bytes", "via": how, "retry_after": secs);
+    let mut r = error(
+        StatusCode::TOO_MANY_REQUESTS,
+        &format!(
+            "Too much uploaded this hour; try again in {} minutes",
+            secs.div_ceil(60)
+        ),
+    );
+    r.headers_mut().insert(header::RETRY_AFTER, secs.into());
+    r
 }
 
 fn too_large(max_size: u64) -> Response<Body> {
