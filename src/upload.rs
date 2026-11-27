@@ -2,7 +2,7 @@
 //! (BUD-02, BUD-06), `DELETE /<sha256>` and `GET /list/<pubkey>` (BUD-12),
 //! `PUT /report` (BUD-09).
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use http_body_util::BodyExt;
@@ -17,6 +17,7 @@ use crate::hash::Hash;
 use crate::http::{self, error};
 use crate::ingest;
 use crate::routes::{blob_url, client_ip};
+use crate::scan::{Banner, Checked, Match, Source};
 use crate::server::Body;
 use crate::store::Record;
 use crate::writer::{Deleted, Refused};
@@ -162,22 +163,57 @@ pub async fn upload(app: &'static App, req: Request<Incoming>, peer: SocketAddr)
     {
         return error(StatusCode::FORBIDDEN, "The auth token isn't for this blob");
     }
-    store(app, blob, token.map(|t| t.pubkey), "upload").await
+    store(app, blob, token.map(|t| t.pubkey), ip, "upload").await
 }
 
 /// Keep an ingested blob and answer with its descriptor: 201 if it's new,
-/// 200 if it was here (BUD-02, BUD-04).
+/// 200 if it was here (BUD-02, BUD-04). A new image is checked against
+/// known CSAM first, if `scan` is enabled, and a match isn't kept.
 pub async fn store(
     app: &'static App,
     blob: crate::writer::Ingested,
     owner: Option<[u8; 32]>,
+    ip: IpAddr,
     how: &str,
 ) -> Response<Body> {
     let (hash, size) = (blob.hash, blob.size);
-    match app.writer.insert(blob, owner, now()).await {
+    let mut unscanned = false;
+    if let Some(scanner) = &app.scanner
+        && !matches!(app.store.find(&hash, false), Ok(Some(_)))
+    {
+        match scanner.check(&blob).await {
+            Checked::Skipped | Checked::Clean => {}
+            Checked::Unchecked(e) => {
+                crate::warn!("scan_deferred", "blob": hash.hex(), "error": e);
+                unscanned = true;
+            }
+            Checked::Matched(pdq, verdict) => {
+                let source = Source::of_ingested(&blob);
+                let m = Match {
+                    hash,
+                    size,
+                    mime: blob.mime.as_deref(),
+                    pdq,
+                    verdict,
+                    via: how,
+                    owners: owner.into_iter().collect(),
+                    ip: Some(ip),
+                    uploaded: None,
+                };
+                if let Err(e) = scanner
+                    .on_match(m, Some(&source), Banner::Writer(&app.writer))
+                    .await
+                {
+                    crate::error!("scan_match_failed", "blob": hash.hex(), "error": format!("{e:#}"));
+                }
+                return error(StatusCode::FORBIDDEN, BANNED);
+            }
+        }
+    }
+    match app.writer.insert(blob, owner, now(), unscanned).await {
         Ok(stored) => {
             if stored.created {
-                crate::info!("stored", "via": how, "blob": hash.hex(), "size": size, "type": stored.record.mime);
+                crate::info!("stored", "via": how, "blob": hash.hex(), "size": size, "type": stored.record.mime, "owner": owner.map(hex::encode), "ip": ip.to_string(), "unscanned": unscanned);
                 app.compressor.offer(&stored.record);
             }
             let status = if stored.created {

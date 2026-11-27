@@ -164,7 +164,7 @@ pub async fn mirror(app: &'static App, req: Request<Incoming>, peer: SocketAddr)
             "The fetched blob isn't the one the auth token names",
         );
     }
-    store(app, blob, token.map(|t| t.pubkey), "mirror").await
+    store(app, blob, token.map(|t| t.pubkey), ip, "mirror").await
 }
 
 /// Whether a URL's host may be fetched: a name (checked when it resolves),

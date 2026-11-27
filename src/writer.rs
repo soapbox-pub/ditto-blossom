@@ -15,7 +15,7 @@ use tokio::sync::oneshot;
 
 use crate::blobs::{Files, TempFile};
 use crate::hash::Hash;
-use crate::store::{INLINE_MAX, Record, Store, flag};
+use crate::store::{Banned, INLINE_MAX, Record, Store, flag};
 
 /// The most jobs one commit takes.
 const MAX_BATCH: usize = 256;
@@ -69,17 +69,30 @@ pub enum BrotliCopy {
     None,
 }
 
+/// A ban for the writer to carry out: what, why, and where to preserve
+/// what it removes.
+pub struct BanJob {
+    pub targets: Vec<Banned>,
+    pub reason: String,
+    pub preserve: Option<std::path::PathBuf>,
+}
+
 enum Job {
-    Insert(
-        Ingested,
-        Option<[u8; 32]>,
-        u64,
-        oneshot::Sender<Result<Stored>>,
-    ),
+    Insert(Insert, oneshot::Sender<Result<Stored>>),
     AddOwner(Hash, [u8; 32], oneshot::Sender<Result<Option<Record>>>),
     Delete(Hash, [u8; 32], oneshot::Sender<Result<Deleted>>),
     Brotli(u64, Hash, BrotliCopy),
     Report(Vec<Hash>, [u8; 32], Vec<u8>, oneshot::Sender<Result<()>>),
+    Ban(BanJob, oneshot::Sender<Result<Vec<Hash>>>),
+    Unqueue(Hash),
+}
+
+struct Insert {
+    blob: Ingested,
+    owner: Option<[u8; 32]>,
+    now: u64,
+    /// Kept without Shield's say: queue it to be asked again.
+    unscanned: bool,
 }
 
 #[derive(Clone)]
@@ -106,14 +119,32 @@ impl Writer {
         answer.await.context("the writer has stopped")?
     }
 
-    /// Keep a blob, owned by `owner` if given, uploaded `now`.
+    /// Keep a blob, owned by `owner` if given, uploaded `now`; if
+    /// `unscanned`, queued for Shield.
     pub async fn insert(
         &self,
         blob: Ingested,
         owner: Option<[u8; 32]>,
         now: u64,
+        unscanned: bool,
     ) -> Result<Stored> {
-        self.ask(|r| Job::Insert(blob, owner, now, r)).await
+        let job = Insert {
+            blob,
+            owner,
+            now,
+            unscanned,
+        };
+        self.ask(|r| Job::Insert(job, r)).await
+    }
+
+    /// Ban, as `ditto-blossom ban` does: the blobs taken out.
+    pub async fn ban(&self, job: BanJob) -> Result<Vec<Hash>> {
+        self.ask(|r| Job::Ban(job, r)).await
+    }
+
+    /// Take a blob off the queue for Shield; nobody waits on it.
+    pub fn unqueue(&self, hash: Hash) {
+        let _ = self.tx.send(Job::Unqueue(hash));
     }
 
     /// Give an existing blob another owner; `None` if it isn't here.
@@ -144,6 +175,7 @@ enum Reply {
     ),
     Delete(oneshot::Sender<Result<Deleted>>, Result<Deleted>),
     Report(oneshot::Sender<Result<()>>, Result<()>),
+    Ban(oneshot::Sender<Result<Vec<Hash>>>, Result<Vec<Hash>>),
 }
 
 fn run(store: &'static Store, files: &'static Files, rx: mpsc::Receiver<Job>) {
@@ -169,9 +201,35 @@ fn batch(store: &'static Store, files: &'static Files, jobs: Vec<Job>) {
     };
     for job in jobs {
         match job {
-            Job::Insert(blob, owner, now, reply) => {
-                let r = insert(store, files, &mut txn, blob, owner, now, &mut placed);
+            Job::Insert(job, reply) => {
+                let r = insert(store, files, &mut txn, job, &mut placed);
                 replies.push(Reply::Insert(reply, r));
+            }
+            Job::Ban(job, reply) => {
+                let r = crate::moderate::ban_txn(
+                    store,
+                    files,
+                    &mut txn,
+                    &job.targets,
+                    &job.reason,
+                    job.preserve.as_deref(),
+                    crate::upload::now(),
+                )
+                .map(|doomed| {
+                    doomed
+                        .into_iter()
+                        .map(|(seq, rec)| {
+                            unlink.push((seq, rec.hash));
+                            rec.hash
+                        })
+                        .collect()
+                });
+                replies.push(Reply::Ban(reply, r));
+            }
+            Job::Unqueue(hash) => {
+                if let Err(e) = store.unqueue_unscanned(&mut txn, &hash) {
+                    crate::warn!("unqueue_failed", "blob": hash.hex(), "error": format!("{e:#}"));
+                }
             }
             Job::AddOwner(hash, owner, reply) => {
                 let r = (|| -> Result<Option<Record>> {
@@ -262,6 +320,7 @@ fn batch(store: &'static Store, files: &'static Files, jobs: Vec<Job>) {
             Reply::AddOwner(tx, r) => drop(tx.send(settle(r, &failed))),
             Reply::Delete(tx, r) => drop(tx.send(settle(r, &failed))),
             Reply::Report(tx, r) => drop(tx.send(settle(r, &failed))),
+            Reply::Ban(tx, r) => drop(tx.send(settle(r, &failed))),
         }
     }
 }
@@ -271,11 +330,15 @@ fn insert(
     store: &Store,
     files: &Files,
     txn: &mut crate::lmdb::RwTxn<'_>,
-    blob: Ingested,
-    owner: Option<[u8; 32]>,
-    now: u64,
+    job: Insert,
     placed: &mut Vec<(Hash, bool)>,
 ) -> Result<Stored> {
+    let Insert {
+        blob,
+        owner,
+        now,
+        unscanned,
+    } = job;
     if store.banned(txn, Some(&blob.hash), owner.as_ref())? {
         return Err(Refused.into());
     }
@@ -313,6 +376,9 @@ fn insert(
     }
     if let Some(pk) = owner {
         store.add_owner(txn, seq, record.uploaded, &pk)?;
+    }
+    if unscanned {
+        store.queue_unscanned(txn, &record.hash, now)?;
     }
     Ok(Stored {
         record,
@@ -360,7 +426,8 @@ fn fail_all(jobs: Vec<Job>, e: &anyhow::Error) {
             Job::AddOwner(.., r) => drop(r.send(Err(err))),
             Job::Delete(.., r) => drop(r.send(Err(err))),
             Job::Report(.., r) => drop(r.send(Err(err))),
-            Job::Brotli(..) => {}
+            Job::Ban(_, r) => drop(r.send(Err(err))),
+            Job::Brotli(..) | Job::Unqueue(_) => {}
         }
     }
 }

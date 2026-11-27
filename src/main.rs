@@ -18,10 +18,13 @@ mod log;
 mod mime;
 mod mirror;
 mod moderate;
+mod pdq;
 mod routes;
+mod scan;
 mod send_file;
 mod serve;
 mod server;
+mod shield;
 mod store;
 mod upload;
 mod writer;
@@ -42,6 +45,8 @@ usage:
   ditto-blossom ban [-c CONFIG] [--reason TEXT] [--preserve DIR] [--pubkey HEX]... [SHA256]...
   ditto-blossom unban [-c CONFIG] [--pubkey HEX]... [SHA256]...
   ditto-blossom bans [-c CONFIG]
+  ditto-blossom scan [-c CONFIG] [--from SEQ] [--limit N] [--dry-run]
+  ditto-blossom pdq FILE...
   ditto-blossom --version
 
 CONFIG defaults to ./ditto-blossom.toml.
@@ -52,7 +57,12 @@ remove takes blobs out entirely, whoever owns them.
 ban does that and keeps them out: banned blobs aren't stored again, by
 anyone, and banned pubkeys can't upload or mirror. A pubkey's ban takes out
 and bans every blob it owns; --preserve copies each blob it removes to DIR
-first. unban lifts bans; bans lists them.";
+first. unban lifts bans; bans lists them.
+scan asks Arachnid Shield about every image already here, and deals with
+each match as an upload's: preserved, banned with its uploaders, recorded
+and alerted. --from carries on from the seq a stopped scan gave; --limit
+stops after N blobs; --dry-run only lists matches.
+pdq prints each image's PDQ hash (base64) and quality, as scan sends them.";
 
 /// How often reads are folded into the access table.
 const ACCESS_FLUSH: Duration = Duration::from_secs(300);
@@ -67,7 +77,7 @@ fn main() {
 fn run() -> Result<()> {
     let mut args = std::env::args().skip(1).peekable();
     let command = match args.peek().map(String::as_str) {
-        Some("serve" | "import" | "remove" | "ban" | "unban" | "bans") => {
+        Some("serve" | "import" | "remove" | "ban" | "unban" | "bans" | "scan" | "pdq") => {
             args.next().expect("peeked")
         }
         Some("--version" | "-V") => {
@@ -84,6 +94,8 @@ fn run() -> Result<()> {
     let (mut sqlite, mut dir, mut copy, mut verify) = (None, None, false, false);
     let mut hashes = Vec::new();
     let (mut pubkeys, mut reason, mut preserve) = (Vec::new(), String::new(), None);
+    let (mut from, mut limit, mut dry_run) = (0u64, None, false);
+    let mut paths = Vec::new();
     let names_blobs = matches!(command.as_str(), "remove" | "ban" | "unban");
     let targeted = matches!(command.as_str(), "ban" | "unban");
     while let Some(arg) = args.next() {
@@ -96,6 +108,14 @@ fn run() -> Result<()> {
             "--verify" if command == "import" => verify = true,
             "--reason" if command == "ban" => reason = value()?,
             "--preserve" if command == "ban" => preserve = Some(PathBuf::from(value()?)),
+            "--from" if command == "scan" => {
+                from = value()?.parse().context("--from takes a blob's seq")?
+            }
+            "--limit" if command == "scan" => {
+                limit = Some(value()?.parse().context("--limit takes a number")?)
+            }
+            "--dry-run" if command == "scan" => dry_run = true,
+            path if command == "pdq" && !path.starts_with('-') => paths.push(PathBuf::from(path)),
             "--pubkey" if targeted => {
                 let hex = value()?;
                 pubkeys.push(
@@ -120,12 +140,19 @@ fn run() -> Result<()> {
     if targeted && targets.is_empty() {
         bail!("{command} needs a SHA256 or --pubkey\n\n{USAGE}");
     }
+    if command == "pdq" {
+        return pdq_files(&paths);
+    }
     let config = Config::load(&config_path)?;
     match command.as_str() {
         "remove" => import::remove(&config, &hashes),
         "ban" => moderate::ban(&config, &targets, &reason, preserve.as_deref()),
         "unban" => moderate::unban(&config, &targets),
         "bans" => moderate::list(&config),
+        "scan" => {
+            install_crypto();
+            scan::scan_existing(&config, from, limit, dry_run)
+        }
         "import" => import::run(
             &config,
             &sqlite.context("import needs --sqlite")?,
@@ -135,6 +162,19 @@ fn run() -> Result<()> {
         ),
         _ => serve(config),
     }
+}
+
+fn pdq_files(paths: &[PathBuf]) -> Result<()> {
+    for p in paths {
+        let f =
+            std::fs::File::open(p).with_context(|| format!("Could not open {}", p.display()))?;
+        match pdq::of(std::io::BufReader::new(f)) {
+            Ok(Some(h)) => println!("{}\t{:.2}\t{}", h.base64(), h.quality, p.display()),
+            Ok(None) => println!("-\t-\t{}", p.display()),
+            Err(e) => println!("-\t{e}\t{}", p.display()),
+        }
+    }
+    Ok(())
 }
 
 fn serve(config: Config) -> Result<()> {
@@ -153,6 +193,11 @@ fn serve(config: Config) -> Result<()> {
         let shutdown = CancellationToken::new();
         tokio::spawn(flush_access(app, shutdown.clone()));
         tokio::spawn(stop_on_signal(shutdown.clone()));
+        tokio::spawn(scan::retry_unscanned(
+            app,
+            Duration::from_secs(app.config.scan.retry_every.max(10)),
+            shutdown.clone(),
+        ));
         server::serve(listener, move |req, peer| routes::handle(app, req, peer), shutdown).await;
 
         let seqs = app.access.take();

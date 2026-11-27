@@ -40,6 +40,52 @@ pub struct Config {
     pub mirror: Mirror,
     #[serde(default)]
     pub report: Report,
+    #[serde(default)]
+    pub scan: Scan,
+}
+
+/// Matching uploads against known CSAM with Arachnid Shield (see `scan`).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Scan {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_shield_url")]
+    pub shield_url: String,
+    /// A file holding `username:password` for Shield, readable by the
+    /// server and no one else.
+    #[serde(default)]
+    pub credentials_file: Option<PathBuf>,
+    /// Where a match's blobs and its record are kept, a directory each:
+    /// what US law has a provider preserve for its NCMEC report.
+    #[serde(default)]
+    pub evidence: Option<PathBuf>,
+    /// Run on each match, with its record (JSON) on stdin: to tell someone.
+    #[serde(default)]
+    pub alert_command: Vec<String>,
+    /// Seconds between tries at blobs kept while Shield couldn't be asked.
+    #[serde(default = "default_retry_every")]
+    pub retry_every: u64,
+}
+
+fn default_shield_url() -> String {
+    "https://shield.projectarachnid.com".into()
+}
+fn default_retry_every() -> u64 {
+    300
+}
+
+impl Default for Scan {
+    fn default() -> Scan {
+        Scan {
+            enabled: false,
+            shield_url: default_shield_url(),
+            credentials_file: None,
+            evidence: None,
+            alert_command: Vec::new(),
+            retry_every: default_retry_every(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -164,6 +210,14 @@ impl Config {
         let mut config: Config = toml::from_str(text)?;
         config.public_url = config.public_url.trim_end_matches('/').to_string();
         config.domain()?;
+        if config.scan.enabled {
+            if config.scan.credentials_file.is_none() {
+                bail!("scan needs credentials_file");
+            }
+            if config.scan.evidence.is_none() {
+                bail!("scan needs evidence, a directory to keep matches in");
+            }
+        }
         Ok(config)
     }
 

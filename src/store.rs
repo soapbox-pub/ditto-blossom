@@ -172,6 +172,8 @@ pub struct Store {
     reports: Db,
     banned_blobs: Db,
     banned_pubkeys: Db,
+    /// Blobs kept while Shield couldn't be asked about them: hash → when.
+    unscanned: Db,
     bodies: Db,
     brotli: Db,
     access: Db,
@@ -213,6 +215,7 @@ impl Store {
         );
         let banned_blobs = env.create_db("banned_blobs", DbFlags::PLAIN)?;
         let banned_pubkeys = env.create_db("banned_pubkeys", DbFlags::PLAIN)?;
+        let unscanned = env.create_db("unscanned", DbFlags::PLAIN)?;
         {
             let mut txn = env.write_txn()?;
             match txn.get(info, b"version")? {
@@ -240,6 +243,7 @@ impl Store {
             reports,
             banned_blobs,
             banned_pubkeys,
+            unscanned,
             bodies,
             brotli,
             access,
@@ -495,16 +499,7 @@ impl Store {
     /// Forget a blob entirely: its record, name, inline bytes and owners.
     /// Its files are the caller's to remove.
     pub fn remove(&self, txn: &mut RwTxn<'_>, seq: u64, rec: &Record) -> Result<()> {
-        let mut owners = Vec::new();
-        {
-            let mut cur = txn.cursor(self.blob_owners)?;
-            let mut e = cur.set(&seq.to_be_bytes())?;
-            while let Some((_, pk)) = e {
-                owners.push(<[u8; 32]>::try_from(pk).context("An owner is corrupt")?);
-                e = cur.next_dup()?;
-            }
-        }
-        for pk in owners {
+        for pk in self.owners_of(txn, seq)? {
             txn.del(self.owners, &pk, Some(&stamp(rec.uploaded, seq)))?;
         }
         txn.del(self.blob_owners, &seq.to_be_bytes(), None)?;
@@ -512,7 +507,48 @@ impl Store {
         txn.del(self.ids, &rec.hash.0, None)?;
         txn.del(self.bodies, &seq.to_ne_bytes(), None)?;
         txn.del(self.brotli, &seq.to_ne_bytes(), None)?;
+        txn.del(self.unscanned, &rec.hash.0, None)?;
         Ok(())
+    }
+
+    /// Who owns a blob.
+    pub fn owners_of(&self, txn: &Txn<'_>, seq: u64) -> Result<Vec<[u8; 32]>> {
+        let mut owners = Vec::new();
+        let mut cur = txn.cursor(self.blob_owners)?;
+        let mut e = cur.set(&seq.to_be_bytes())?;
+        while let Some((_, pk)) = e {
+            owners.push(<[u8; 32]>::try_from(pk).context("An owner is corrupt")?);
+            e = cur.next_dup()?;
+        }
+        Ok(owners)
+    }
+
+    /// Note a blob kept without Shield's say, to ask again later.
+    pub fn queue_unscanned(&self, txn: &mut RwTxn<'_>, hash: &Hash, at: u64) -> Result<()> {
+        txn.put(self.unscanned, &hash.0, &at.to_le_bytes())?;
+        Ok(())
+    }
+
+    pub fn unqueue_unscanned(&self, txn: &mut RwTxn<'_>, hash: &Hash) -> Result<()> {
+        txn.del(self.unscanned, &hash.0, None)?;
+        Ok(())
+    }
+
+    /// Up to `limit` blobs waiting on Shield.
+    pub fn unscanned(&'static self, limit: usize) -> Result<Vec<Hash>> {
+        self.read(|txn| -> Result<Vec<Hash>> {
+            let mut cur = txn.cursor(self.unscanned)?;
+            let mut out = Vec::new();
+            let mut e = cur.first()?;
+            while let Some((k, _)) = e {
+                if out.len() == limit {
+                    break;
+                }
+                out.push(Hash(k.try_into().context("An unscanned entry is corrupt")?));
+                e = cur.next()?;
+            }
+            Ok(out)
+        })?
     }
 
     /// Keep a report (a kind 1984 event's JSON) about a blob. Whether it's new.

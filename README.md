@@ -133,6 +133,44 @@ removed. Use it when what's removed must be kept, as for a CSAM report.
 `ditto-blossom unban` lifts bans (a pubkey's blobs stay banned), and
 `ditto-blossom bans` lists them, a line each: kind, hex, when, reason.
 
+## Scanning
+
+With `[scan]` enabled, each new image is checked against known CSAM with
+[Arachnid Shield](https://shield.projectarachnid.com/docs/), the Canadian
+Centre for Child Protection's free API. The server hashes the image with
+[PDQ](https://github.com/facebook/ThreatExchange/tree/main/pdq) itself and
+sends only the hash, so resized and recompressed copies of known images
+match too, and no image leaves the server. JPEG, PNG, WebP, GIF (its first
+frame) and BMP are hashed; video and other formats aren't yet.
+
+A match isn't stored. Instead, in one new directory under `evidence`:
+
+- `blobs/` gets the blob, and every other blob its uploader owned, which
+  their ban takes out (as `ban --preserve` would);
+- `record.json` says when, how it came (`upload`, `mirror`, `retry` or
+  `scan`), who sent it and from what address, its PDQ and what Shield
+  said;
+
+then the blob and its uploader are banned (keys in `upload.exempt` lose the
+blob but keep their key), and `alert_command` is run with the record on
+stdin. The server answers 403. A US provider must report what it finds to
+[NCMEC](https://report.cybertip.org/) and preserve it for a year; the
+directory is what that takes.
+
+If Shield can't be asked, the image is kept and queued, and asked about
+again every `retry_every` seconds, so an outage doesn't stop uploads. A
+match found then is dealt with the same way.
+
+```sh
+sudo -u ditto-blossom ditto-blossom scan -c /etc/ditto-blossom.toml [--dry-run]
+```
+
+asks about every image already stored, a hundred hashes a request, beside
+the running server. It logs `scan_progress` with the seq it's reached; if it
+stops, `--from SEQ` carries on; `--limit N` stops after N blobs, to time a
+slice first. `--dry-run` lists matches and touches nothing.
+`ditto-blossom pdq FILE...` prints the hashes it would send.
+
 ## Developing
 
 ```sh

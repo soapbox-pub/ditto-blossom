@@ -30,6 +30,8 @@ pub struct App {
     pub compressor: Compressor,
     /// What mirrors fetch with.
     pub http: reqwest::Client,
+    /// Matches new images against known CSAM, if `scan` is enabled.
+    pub scanner: Option<crate::scan::Scanner>,
 }
 
 impl App {
@@ -90,6 +92,7 @@ impl App {
         let workers = config.compress_threads.unwrap_or((cpus / 2).max(1));
         let compressor = Compressor::start(store, files, writer.clone(), workers);
         let http = crate::mirror::client(config.mirror.allow_private);
+        let scanner = crate::scan::Scanner::open(&config)?;
         Ok(Box::leak(Box::new(App {
             auth: Verifier::new(config.domain()?),
             upload_limit: RateLimit::per_minute(config.upload.per_minute),
@@ -105,6 +108,7 @@ impl App {
             writer,
             compressor,
             http,
+            scanner,
         })))
     }
 }

@@ -8,6 +8,7 @@ license = "AGPL-3.0-or-later"
 [dependencies]
 anyhow = "1.0.104"
 base64 = "0.23.1"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif", "bmp"] }
 brotli = "9.0.0"
 bytes = "1.12.1"
 hex = "0.4.3"

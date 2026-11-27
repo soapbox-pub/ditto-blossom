@@ -232,4 +232,5 @@ async fn head_conditional_ranges_and_errors() {
     assert_eq!(r.headers()["content-type"], "image/jpeg");
 }
 
+mod scan;
 mod writes;

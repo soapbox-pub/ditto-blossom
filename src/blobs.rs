@@ -188,7 +188,6 @@ impl TempFile {
         self.file.as_mut().expect("open until placed")
     }
 
-    #[cfg(test)]
     pub fn path(&self) -> &Path {
         &self.path
     }
