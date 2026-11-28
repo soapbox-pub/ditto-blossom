@@ -50,6 +50,10 @@ pub async fn blob(app: &'static App, req: &Request<Incoming>, hash: Hash) -> Res
         }
     };
     let rec = &found.record;
+    // Its uploader is banned: kept, but not served, until that's lifted.
+    if rec.has(crate::store::flag::SUSPENDED) {
+        return error(StatusCode::NOT_FOUND, "Blob not found");
+    }
     if rec.has(crate::store::flag::UNSCANNED) && app.config.scan.hold && app.scanner.is_some() {
         let mut r = error(
             StatusCode::SERVICE_UNAVAILABLE,

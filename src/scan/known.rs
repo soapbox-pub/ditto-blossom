@@ -3,9 +3,10 @@
 //! Each new image is hashed with PDQ here, and only the hash goes to
 //! Shield. A match isn't stored: it's preserved in its own directory under
 //! `scan.evidence`, with a record of who sent it, from where and what
-//! Shield said, and banned, with its uploader (unless exempt), whose other
-//! blobs are preserved and banned too. Then `scan.alert_command` is run, to
-//! tell someone, who has a report to make to NCMEC.
+//! Shield said, and banned, with its uploader (unless protected), whose other
+//! blobs are suspended: hidden, and kept, so lifting the ban undoes it. Then
+//! `scan.alert_command` is run, to tell someone, who has a report to make to
+//! NCMEC.
 //!
 //! If Shield can't be asked, the blob is kept and queued, and asked about
 //! again every `scan.retry_every` seconds: an outage doesn't stop uploads.
@@ -38,7 +39,8 @@ pub struct Scanner {
     pub shield: Shield,
     evidence: PathBuf,
     alert: Vec<String>,
-    exempt: std::collections::HashSet<[u8; 32]>,
+    /// Keys a match never bans (see `Config::protected`).
+    protected: crate::moderate::Protected,
     decoding: Semaphore,
 }
 
@@ -132,12 +134,12 @@ pub enum Banner<'a> {
 }
 
 impl Banner<'_> {
-    async fn ban(&self, job: BanJob) -> Result<Vec<Hash>> {
+    async fn ban(&self, job: BanJob) -> Result<crate::writer::BanDone> {
         match self {
             Banner::Writer(w) => w.ban(job).await,
             Banner::Direct(store, files) => {
                 let mut txn = store.write_txn()?;
-                let doomed = crate::moderate::ban_txn(
+                let done = crate::moderate::ban_txn(
                     store,
                     files,
                     &mut txn,
@@ -145,15 +147,16 @@ impl Banner<'_> {
                     &job.reason,
                     job.preserve.as_deref(),
                     now(),
+                    &job.protected,
                 )?;
                 txn.commit()?;
-                let mut out = Vec::new();
-                for (seq, rec) in doomed {
+                let mut removed = Vec::new();
+                for (seq, rec) in done.removed {
                     files.remove(seq, &rec.hash)?;
                     crate::info!("removed", "blob": rec.hash.hex(), "size": rec.size);
-                    out.push(rec.hash);
+                    removed.push(rec.hash);
                 }
-                Ok(out)
+                Ok((removed, done.suspended.iter().map(|r| r.hash).collect()))
             }
         }
     }
@@ -178,7 +181,7 @@ impl Scanner {
             shield: Shield::new(&scan.shield_url, &creds)?,
             evidence,
             alert: scan.alert_command.clone(),
-            exempt: config.upload.exempt.clone(),
+            protected: config.protected(),
             decoding: Semaphore::new(DECODING),
         }))
     }
@@ -234,7 +237,7 @@ impl Scanner {
         let banned_owners: Vec<[u8; 32]> = m
             .owners
             .iter()
-            .filter(|pk| !self.exempt.contains(*pk))
+            .filter(|pk| !self.protected.contains(*pk))
             .copied()
             .collect();
         let reason = format!(
@@ -250,8 +253,9 @@ impl Scanner {
             targets,
             reason: reason.clone(),
             preserve: Some(blobs.clone()),
+            protected: self.protected.clone(),
         };
-        let removed = match banner.ban(job(targets)).await {
+        let (removed, suspended) = match banner.ban(job(targets)).await {
             Ok(r) => r,
             Err(e) => {
                 // At least keep the blob itself out; its owners' other
@@ -262,7 +266,7 @@ impl Scanner {
                     .await
                     .unwrap_or_else(|e| {
                         problems.push(format!("banning the blob: {e:#}"));
-                        Vec::new()
+                        (Vec::new(), Vec::new())
                     })
             }
         };
@@ -285,13 +289,14 @@ impl Scanner {
                 "near_match_details": m.verdict.near_match_details,
             },
             "removed": removed.iter().map(Hash::hex).collect::<Vec<_>>(),
+            "suspended": suspended.iter().map(Hash::hex).collect::<Vec<_>>(),
             "evidence": dir.display().to_string(),
             "problems": problems,
         });
         let text = serde_json::to_vec_pretty(&record)?;
         std::fs::write(dir.join("record.json"), &text)
             .with_context(|| format!("Could not write {}", dir.join("record.json").display()))?;
-        crate::error!("scan_match", "blob": m.hash.hex(), "via": m.via, "classification": m.verdict.classification, "uploaders": record["uploaders"], "ip": record["ip"], "removed": removed.len(), "evidence": dir.display().to_string(), "problems": record["problems"]);
+        crate::error!("scan_match", "blob": m.hash.hex(), "via": m.via, "classification": m.verdict.classification, "uploaders": record["uploaders"], "ip": record["ip"], "removed": removed.len(), "suspended": suspended.len(), "evidence": dir.display().to_string(), "problems": record["problems"]);
         self.alert(text).await;
         Ok(dir)
     }

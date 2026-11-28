@@ -499,7 +499,12 @@ pub fn list(app: &'static App, req: &Request<Incoming>, pubkey: &str) -> Respons
     match app.store.list(&pk, cursor.as_ref(), limit, since, until) {
         Ok(recs) => http::json(
             StatusCode::OK,
-            &Value::Array(recs.iter().map(|r| descriptor(app, r)).collect()),
+            &Value::Array(
+                recs.iter()
+                    .filter(|r| !r.has(crate::store::flag::SUSPENDED))
+                    .map(|r| descriptor(app, r))
+                    .collect(),
+            ),
         ),
         Err(e) => {
             crate::error!("list_failed", "error": format!("{e:#}"));

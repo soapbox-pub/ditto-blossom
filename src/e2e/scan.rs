@@ -194,15 +194,18 @@ async fn a_match_is_kept_out_preserved_and_its_uploader_banned() {
         StatusCode::NOT_FOUND
     );
 
-    // Preserved, with the uploader's other blob, which is gone too.
+    // Preserved; the uploader's other blob suspended: hidden, kept in
+    // place, and recorded as its context.
     let (dir, record) = incident(t.evidence.path());
     assert_eq!(
         std::fs::read(dir.join("blobs").join(Hash::of(BAD).hex())).unwrap(),
         BAD
     );
-    assert_eq!(
-        std::fs::read(dir.join("blobs").join(Hash::of(&earlier).hex())).unwrap(),
-        earlier
+    assert!(!dir.join("blobs").join(Hash::of(&earlier).hex()).exists());
+    assert!(
+        dir.join("blobs")
+            .join(format!("{}.json", Hash::of(&earlier).hex()))
+            .exists()
     );
     assert_eq!(
         get(Hash::of(&earlier)).await.unwrap().status(),
@@ -222,7 +225,8 @@ async fn a_match_is_kept_out_preserved_and_its_uploader_banned() {
     assert_eq!(record["ip"], "127.0.0.1");
     assert_eq!(record["shield"]["classification"], "csam");
     assert_eq!(record["pdq"], pdq_of(BAD));
-    assert_eq!(record["removed"], json!([Hash::of(&earlier).hex()]));
+    assert_eq!(record["removed"], json!([]));
+    assert_eq!(record["suspended"], json!([Hash::of(&earlier).hex()]));
     assert_eq!(record["problems"], json!([]));
 
     // The alert got the record.
@@ -246,7 +250,7 @@ async fn a_match_is_kept_out_preserved_and_its_uploader_banned() {
     assert_eq!(all.len(), 2);
     assert_eq!(all[0].1["uploaders"], json!([hex::encode(pk(&bad))]));
     assert_eq!(all[1].1["uploaders"], json!([hex::encode(pk(&other))]));
-    assert_eq!(all[1].1["removed"], json!([Hash::of(b"just text").hex()]));
+    assert_eq!(all[1].1["suspended"], json!([Hash::of(b"just text").hex()]));
     assert!(s.app.store.is_banned(None, Some(&pk(&other))).unwrap());
 
     // Everyone else is unaffected.

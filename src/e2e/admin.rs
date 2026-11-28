@@ -270,8 +270,8 @@ async fn looks_up_and_bans_blobs_and_uploaders() {
     assert_eq!(who["owned"], 2);
     assert_eq!(who["blobs"].as_array().unwrap().len(), 2);
 
-    // Banned as CSAM, the reported blob goes, and so does its uploader and
-    // all their blobs, each kept: the rest as its context.
+    // Banned as CSAM, the reported blob goes, kept, and its uploader is
+    // banned, their other blobs suspended and recorded as its context.
     let r = post("/api/csam", json!({ "sha256": ha })).await;
     assert_eq!(r.status(), StatusCode::OK);
     let v: Value = r.json().await.unwrap();
@@ -286,10 +286,11 @@ async fn looks_up_and_bans_blobs_and_uploaders() {
     );
     let dir = evidence.path();
     assert_eq!(std::fs::read(dir.join(&ha)).unwrap(), a);
-    assert_eq!(std::fs::read(dir.join(&hb)).unwrap(), b);
+    assert!(!dir.join(&hb).exists(), "suspended, so kept where it was");
     let context: Value =
         serde_json::from_slice(&std::fs::read(dir.join(format!("{hb}.json"))).unwrap()).unwrap();
     assert_eq!(context["context_of"], json!([ha]));
+    assert_eq!(context["suspended"], true);
     use std::os::unix::fs::PermissionsExt;
     assert_eq!(dir.metadata().unwrap().permissions().mode() & 0o777, 0o700);
     for h in [&ha, &hb] {
@@ -305,7 +306,11 @@ async fn looks_up_and_bans_blobs_and_uploaders() {
         StatusCode::FORBIDDEN
     );
     let bans = get("/api/bans").await;
-    assert_eq!(bans.as_array().unwrap().len(), 3);
+    assert_eq!(
+        bans.as_array().unwrap().len(),
+        2,
+        "the blob and its uploader"
+    );
 
     // It's listed as evidence until a CyberTipline report is noted on it.
     assert_eq!(get("/api/stats").await["unreported"], 1);

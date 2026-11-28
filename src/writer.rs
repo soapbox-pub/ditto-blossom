@@ -83,10 +83,15 @@ pub enum BrotliCopy {
 
 /// A ban for the writer to carry out: what, why, and where to preserve
 /// what it removes.
+/// The blobs a ban removed, and those it suspended.
+pub type BanDone = (Vec<Hash>, Vec<Hash>);
+
 pub struct BanJob {
     pub targets: Vec<Banned>,
     pub reason: String,
     pub preserve: Option<std::path::PathBuf>,
+    /// Keys it mustn't name (see `Config::protected`).
+    pub protected: crate::moderate::Protected,
 }
 
 enum Job {
@@ -99,7 +104,7 @@ enum Job {
     /// An upload refused before it was stored.
     Refuse(Hash, f32, oneshot::Sender<Result<()>>),
     Report(Vec<Hash>, [u8; 32], Vec<u8>, oneshot::Sender<Result<()>>),
-    Ban(BanJob, oneshot::Sender<Result<Vec<Hash>>>),
+    Ban(BanJob, oneshot::Sender<Result<BanDone>>),
     Unqueue(Hash),
 }
 
@@ -153,8 +158,8 @@ impl Writer {
         self.ask(|r| Job::Insert(job, r)).await
     }
 
-    /// Ban, as `ditto-blossom ban` does: the blobs taken out.
-    pub async fn ban(&self, job: BanJob) -> Result<Vec<Hash>> {
+    /// Ban, as `ditto-blossom ban` does: the blobs removed, and suspended.
+    pub async fn ban(&self, job: BanJob) -> Result<BanDone> {
         self.ask(|r| Job::Ban(job, r)).await
     }
 
@@ -204,7 +209,7 @@ enum Reply {
     ),
     Delete(oneshot::Sender<Result<Deleted>>, Result<Deleted>),
     Report(oneshot::Sender<Result<()>>, Result<()>),
-    Ban(oneshot::Sender<Result<Vec<Hash>>>, Result<Vec<Hash>>),
+    Ban(oneshot::Sender<Result<BanDone>>, Result<BanDone>),
     Refuse(oneshot::Sender<Result<()>>, Result<()>),
 }
 
@@ -244,15 +249,18 @@ fn batch(store: &'static Store, files: &'static Files, jobs: Vec<Job>) {
                     &job.reason,
                     job.preserve.as_deref(),
                     crate::upload::now(),
+                    &job.protected,
                 )
-                .map(|doomed| {
-                    doomed
+                .map(|done| {
+                    let removed = done
+                        .removed
                         .into_iter()
                         .map(|(seq, rec)| {
                             unlink.push((seq, rec.hash));
                             rec.hash
                         })
-                        .collect()
+                        .collect();
+                    (removed, done.suspended.iter().map(|r| r.hash).collect())
                 });
                 replies.push(Reply::Ban(reply, r));
             }
@@ -285,6 +293,10 @@ fn batch(store: &'static Store, files: &'static Files, jobs: Vec<Job>) {
                     let rec = store
                         .record(&txn, seq)?
                         .context("a blob without its record")?;
+                    // Kept for whoever lifts or reviews the ban, not its uploader.
+                    if rec.has(flag::SUSPENDED) {
+                        return Ok(Deleted::NotOwned);
+                    }
                     if !store.remove_owner(&mut txn, seq, rec.uploaded, &owner)? {
                         return Ok(Deleted::NotOwned);
                     }

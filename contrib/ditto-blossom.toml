@@ -23,6 +23,11 @@ open_files = 4096
 # Unset: half the CPUs. 0: none.
 # compress_threads = 4
 
+# Hex pubkeys no ban may name (ban --pubkey, the dashboard, a scan match):
+# keys that upload for many people, like another server's. upload.exempt
+# keys are protected too.
+protected = []
+
 [upload]
 require_auth = true
 max_size = 2147483648   # bytes

@@ -505,22 +505,22 @@ async fn bans_keep_blobs_and_uploaders_out() {
     }
 
     let kept_copies = tempfile::tempdir().unwrap();
-    crate::moderate::ban_in(
+    let gone = crate::moderate::ban_in(
         s.app.store,
         s.app.files,
         &[Banned::Pubkey(pk(&bad))],
         "csam",
         Some(kept_copies.path()),
+        &Default::default(),
     )
     .unwrap();
-    // Preserved first, inline and file alike, readable only by their owner,
-    // each with who owned it and why it went.
+    // Its blobs are suspended, not deleted: recorded, readable only by their
+    // owner, with who owned them and why, but not copied, as they're kept.
+    assert_eq!(gone.len(), 2);
     for data in [&small, &large] {
         use std::os::unix::fs::PermissionsExt;
         let h = Hash::of(data).hex();
-        let path = kept_copies.path().join(&h);
-        assert_eq!(&std::fs::read(&path).unwrap(), data);
-        assert_eq!(path.metadata().unwrap().permissions().mode() & 0o777, 0o600);
+        assert!(!kept_copies.path().join(&h).exists());
         let json = kept_copies.path().join(format!("{h}.json"));
         assert_eq!(json.metadata().unwrap().permissions().mode() & 0o777, 0o600);
         let meta: serde_json::Value =
@@ -529,34 +529,28 @@ async fn bans_keep_blobs_and_uploaders_out() {
         assert_eq!(meta["size"], data.len());
         assert_eq!(meta["owners"], serde_json::json!([hex::encode(pk(&bad))]));
         assert_eq!(meta["reason"], "uploader banned: csam");
-    }
-    // A blob someone else owns too stays theirs: kept as context, naming only
-    // the banned uploader, and not banned.
-    let h = Hash::of(&shared);
-    let meta: serde_json::Value = serde_json::from_slice(
-        &std::fs::read(kept_copies.path().join(format!("{}.json", h.hex()))).unwrap(),
-    )
-    .unwrap();
-    assert_eq!(meta["owners"], serde_json::json!([hex::encode(pk(&bad))]));
-    assert_eq!(get(h).await.unwrap().status(), StatusCode::OK);
-    s.app
-        .store
-        .read(|txn| {
-            let seq = s.app.store.seq_of(txn, &h).unwrap().unwrap();
-            assert_eq!(s.app.store.owners_of(txn, seq).unwrap(), [pk(&good)]);
-        })
-        .unwrap();
-
-    // Its blobs are gone, files and all, and banned; others' aren't.
-    for data in [&small, &large] {
+        assert_eq!(meta["suspended"], true);
+        // Hidden, but kept, file and all, and not banned.
         assert_eq!(
             get(Hash::of(data)).await.unwrap().status(),
             StatusCode::NOT_FOUND
         );
+        assert!(!s.app.store.is_banned(Some(&Hash::of(data)), None).unwrap());
     }
-    assert!(!s.app.files.path(&Hash::of(&large), false).exists());
+    assert!(s.app.files.path(&Hash::of(&large), false).exists());
+    // A blob someone else owns too is left alone, both its owners kept.
+    let h = Hash::of(&shared);
+    assert!(
+        !kept_copies
+            .path()
+            .join(format!("{}.json", h.hex()))
+            .exists()
+    );
+    assert_eq!(get(h).await.unwrap().status(), StatusCode::OK);
+    assert!(s.app.store.is_owner(&h, &pk(&good)).unwrap());
+    assert!(s.app.store.is_owner(&h, &pk(&bad)).unwrap());
     assert_eq!(get(Hash::of(&kept)).await.unwrap().status(), StatusCode::OK);
-    assert_eq!(s.app.store.bans().unwrap().len(), 3);
+    assert_eq!(s.app.store.bans().unwrap().len(), 1);
 
     // The banned key can't upload anything, even new bytes.
     let r = upload(&bad, b"anything new").send().await.unwrap();
@@ -565,59 +559,131 @@ async fn bans_keep_blobs_and_uploaders_out() {
         r.headers()["x-reason"],
         "This blob, or its uploader, is banned here"
     );
-
-    // Another key can't put its blobs back: refused before the body with
-    // X-SHA-256, by the writer without it, and at the BUD-06 preflight.
-    for data in [&small, &large] {
-        let h = Hash::of(data);
-        let r = upload(&good, data)
-            .header("x-sha-256", h.hex())
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(r.status(), StatusCode::FORBIDDEN);
-        let r = upload(&good, data).send().await.unwrap();
-        assert_eq!(r.status(), StatusCode::FORBIDDEN);
-        let r = c
-            .head(format!("{}/upload", s.url))
-            .header("authorization", auth(&good, "upload", &[h]))
-            .header("x-sha-256", h.hex())
-            .header("x-content-length", data.len().to_string())
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(r.status(), StatusCode::FORBIDDEN);
-        assert_eq!(get(h).await.unwrap().status(), StatusCode::NOT_FOUND);
-    }
-
-    // Nor mirror them in from elsewhere.
+    // Nor mirror.
     let origin = start("").await;
-    let h = put(origin.app, &large, None);
+    let h = put(origin.app, &kept, None);
     let body = serde_json::json!({ "url": format!("{}/{}", origin.url, h.hex()) }).to_string();
-    let mirror = |kp: &secp256k1::Keypair, x: Hash| {
-        c.put(format!("{}/mirror", s.url))
-            .header("authorization", auth(kp, "upload", &[x]))
-            .body(body.clone())
+    let r = c
+        .put(format!("{}/mirror", s.url))
+        .header("authorization", auth(&bad, "upload", &[h]))
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::FORBIDDEN);
+    // Another key sending a suspended blob doesn't bring it back.
+    assert!(
+        upload(&good, &small)
             .send()
-    };
-    assert_eq!(
-        mirror(&good, h).await.unwrap().status(),
-        StatusCode::FORBIDDEN
+            .await
+            .unwrap()
+            .status()
+            .is_success()
     );
     assert_eq!(
-        mirror(&bad, Hash::of(&kept)).await.unwrap().status(),
-        StatusCode::FORBIDDEN
+        get(Hash::of(&small)).await.unwrap().status(),
+        StatusCode::NOT_FOUND
     );
-    assert_eq!(get(h).await.unwrap().status(), StatusCode::NOT_FOUND);
+    // Nor can its uploader delete what's kept for review.
+    let r = c
+        .delete(format!("{}/{}", s.url, Hash::of(&large).hex()))
+        .header("authorization", auth(&bad, "delete", &[Hash::of(&large)]))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::NOT_FOUND);
 
-    // Lifting the key's ban lets it upload again; its old blobs stay banned.
-    crate::moderate::unban_in(s.app.store, &[Banned::Pubkey(pk(&bad))]).unwrap();
+    // Lifting the key's ban lets it upload again, and brings its blobs back.
+    let back = crate::moderate::unban_in(s.app.store, &[Banned::Pubkey(pk(&bad))]).unwrap();
+    assert_eq!(back, 2);
+    for data in [&small, &large] {
+        let r = get(Hash::of(data)).await.unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        assert_eq!(&r.bytes().await.unwrap()[..], &data[..]);
+    }
     assert_eq!(
         upload(&bad, b"anything new").send().await.unwrap().status(),
         StatusCode::CREATED
     );
+
+    // A blob banned by name is removed, preserved, and kept out for anyone.
+    let dir = tempfile::tempdir().unwrap();
+    crate::moderate::ban_in(
+        s.app.store,
+        s.app.files,
+        &[Banned::Blob(Hash::of(&large))],
+        "csam",
+        Some(dir.path()),
+        &Default::default(),
+    )
+    .unwrap();
     assert_eq!(
-        upload(&bad, &small).send().await.unwrap().status(),
-        StatusCode::FORBIDDEN
+        std::fs::read(dir.path().join(Hash::of(&large).hex())).unwrap(),
+        large
+    );
+    assert!(!s.app.files.path(&Hash::of(&large), false).exists());
+    let r = upload(&good, &large)
+        .header("x-sha-256", Hash::of(&large).hex())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::FORBIDDEN);
+    assert_eq!(
+        get(Hash::of(&large)).await.unwrap().status(),
+        StatusCode::NOT_FOUND
+    );
+}
+
+#[tokio::test]
+async fn protected_keys_cant_be_banned() {
+    use crate::store::Banned;
+
+    let server = keypair();
+    let pk = server.x_only_public_key().0.to_byte_array();
+    let s = start(&format!("protected = [\"{}\"]\n", hex::encode(pk))).await;
+    let c = client();
+    let mine = b"a blob a whole server's users share a key for".to_vec();
+    let bad = b"the one bad blob among them".to_vec();
+    for data in [&mine, &bad] {
+        let r = c
+            .put(format!("{}/upload", s.url))
+            .header("authorization", auth(&server, "upload", &[Hash::of(data)]))
+            .body(data.to_vec())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::CREATED);
+    }
+    let protected = s.app.config.protected();
+    // By name: refused, and nothing done.
+    let e = crate::moderate::ban_in(
+        s.app.store,
+        s.app.files,
+        &[Banned::Blob(Hash::of(&bad)), Banned::Pubkey(pk)],
+        "csam",
+        None,
+        &protected,
+    )
+    .unwrap_err();
+    assert!(format!("{e:#}").contains("protected"), "{e:#}");
+    assert!(s.app.store.bans().unwrap().is_empty());
+    // As the uploader of CSAM: the blob goes, the key and its others stay.
+    let dir = tempfile::tempdir().unwrap();
+    let (gone, uploaders) = crate::moderate::ban_csam(
+        s.app.store,
+        s.app.files,
+        &[Hash::of(&bad)],
+        &[],
+        dir.path(),
+        &protected,
+    )
+    .unwrap();
+    assert_eq!((gone.len(), uploaders), (1, 0));
+    assert!(!s.app.store.is_banned(None, Some(&pk)).unwrap());
+    let get = |h: Hash| c.get(format!("{}/{}", s.url, h.hex())).send();
+    assert_eq!(get(Hash::of(&mine)).await.unwrap().status(), StatusCode::OK);
+    assert_eq!(
+        get(Hash::of(&bad)).await.unwrap().status(),
+        StatusCode::NOT_FOUND
     );
 }

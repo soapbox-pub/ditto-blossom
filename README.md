@@ -100,15 +100,39 @@ ditto-blossom ban -c /etc/ditto-blossom.toml \
   [--reason TEXT] [--preserve DIR] [--pubkey HEX]... [SHA256]...
 ```
 
-A banned blob can't be stored again by anyone. A banned pubkey can't
-upload or mirror; blobs only it owns are deleted and banned, and it's
-taken off blobs others also own.
+A banned blob is deleted and can't be stored again by anyone. A banned
+pubkey can't upload or mirror, and the blobs only it owns are
+**suspended**, not deleted: they're no longer served or listed, and their
+uploader can't delete them, but they're kept, file and owners, and lifting
+the ban brings them back. Blobs others also own are left alone.
 
-`--preserve DIR` copies each blob before deleting it, with
-`<sha256>.json` (size, type, first upload, owners, reports, reason).
-Owner-only; if a copy fails, nothing is deleted.
+`--preserve DIR` copies each blob it deletes there first, with
+`<sha256>.json` (size, type, first upload, owners, reports, reason), and
+writes the record alone for each blob it suspends. Owner-only; if a copy
+fails, nothing is done.
 
-`unban` lifts bans (a pubkey's blobs stay banned); `bans` lists them.
+`unban` lifts bans, and a pubkey's suspended blobs come back (unless
+another of their owners is banned); `bans` lists them.
+
+```toml
+protected = ["<hex>"]
+```
+
+No ban can name a **protected** pubkey: not `ban --pubkey`, the dashboard,
+or a scan match, which takes only the matching blob. Protect keys that
+upload for many people, like another server's (Spinster signs every upload
+with one key). Keys in `upload.exempt` are protected too.
+
+```sh
+ditto-blossom restore -c /etc/ditto-blossom.toml \
+  [--owner HEX]... [--except SHA256]... [--verify] DIR
+```
+
+puts back blobs a ban deleted by mistake, from the copies `--preserve` (or
+a scan match's `blobs/`) kept in DIR: each is unbanned, linked back into
+place and given back to the owners its `<sha256>.json` names, or
+`--owner`, and its copy removed. `--except` leaves the blobs it names, the
+ones really banned, where they are.
 
 ## Admin dashboard
 
@@ -149,9 +173,10 @@ embeddings so it can be trained on after it's deleted.
 
 ### Child sexual abuse material
 
-**Child abuse…** bans the blob and its uploaders, removing all they
-uploaded, and keeps a copy of it, and of the rest as its context, in
-`preserve` (`data/evidence` by default) for your report to NCMEC. Copies
+**Child abuse…** bans the blob and its uploaders (but protected keys),
+suspending all else they uploaded, and keeps a copy of it, and a record of
+the rest as its context, in `preserve` (`data/evidence` by default) for
+your report to NCMEC. Copies
 are deleted a year after its report number is entered. The dashboard's Help
 covers the rest.
 
@@ -235,15 +260,15 @@ frame) and BMP are hashed; video and other formats aren't yet.
 
 A match isn't stored. Instead, in one new directory under `evidence`:
 
-- `blobs/` gets the blob, and every other blob its uploader owned, which
-  their ban takes out (as `ban --preserve` would);
+- `blobs/` gets the blob, and a record of each other blob its uploader
+  owned, which their ban suspends (as `ban --preserve` would);
 - `record.json` says when, how it came (`upload`, `mirror`, `retry` or
   `scan`), who sent it and from what address, its PDQ and what Shield
   said;
 
-then the blob and its uploader are banned (keys in `upload.exempt` lose the
-blob but keep their key), and `alert_command` is run with the record on
-stdin. The server answers 403. A US provider must report what it finds to
+then the blob and its uploader are banned (protected keys lose the blob
+but keep their key and the rest), and `alert_command` is run with the
+record on stdin. The server answers 403. A US provider must report what it finds to
 [NCMEC](https://report.cybertip.org/) and preserve it for a year; the
 directory is what that takes.
 

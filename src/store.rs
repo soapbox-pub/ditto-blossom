@@ -52,6 +52,9 @@ pub mod flag {
     pub const BROTLI_CHECKED: u8 = 4;
     /// Stored before it was scanned, and not scanned yet (see `scan`).
     pub const UNSCANNED: u8 = 8;
+    /// Hidden because its uploader was banned: not served or listed, but
+    /// kept, file and owners, so lifting the ban brings it back.
+    pub const SUSPENDED: u8 = 16;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

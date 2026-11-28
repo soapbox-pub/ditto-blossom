@@ -1,5 +1,9 @@
-//! `ditto-blossom ban`, `unban` and `bans`: keep blobs and uploaders out
-//! for good. Safe beside a running server, as `remove` is: the writer checks
+//! `ditto-blossom ban`, `unban` and `bans`: keep blobs and uploaders out.
+//!
+//! A ban removes only the blobs it names. A banned uploader's other blobs
+//! are suspended, not deleted: hidden, but kept, so a ban made by mistake
+//! is undone by lifting it. Protected keys (`Config::protected`) can't be
+//! banned at all. Safe beside a running server, as `remove` is: the writer checks
 //! the bans in the transaction that would store a blob, so nothing banned
 //! gets in once the ban is committed. The server bans the same way, through
 //! its writer, when a scan finds a match.
@@ -15,7 +19,7 @@ use crate::blobs::{self, Files};
 use crate::config::Config;
 use crate::hash::{Hash, Hasher};
 use crate::lmdb::RwTxn;
-use crate::store::{Ban, Banned, Record, Store};
+use crate::store::{Ban, Banned, Record, Store, flag};
 use crate::upload::now;
 
 /// Ban each target and take out what it names: a blob, or an uploader's
@@ -31,19 +35,31 @@ pub fn ban(
 ) -> Result<()> {
     let store = Store::open(&config.data)?;
     let files = Files::open(&config.data, 1, false)?;
-    ban_in(&store, &files, targets, reason, preserve).map(|_| ())
+    ban_in(
+        &store,
+        &files,
+        targets,
+        reason,
+        preserve,
+        &config.protected(),
+    )
+    .map(|_| ())
 }
 
-/// The records of the blobs it removed: what a cache in front may still
-/// hold copies of.
+/// Keys a ban never names: see `Config::protected`.
+pub type Protected = std::collections::HashSet<[u8; 32]>;
+
+/// The records of the blobs it removed or suspended: what a cache in front
+/// may still hold copies of.
 pub fn ban_in(
     store: &Store,
     files: &Files,
     targets: &[Banned],
     reason: &str,
     preserve: Option<&Path>,
+    protected: &Protected,
 ) -> Result<Vec<Record>> {
-    ban_with(store, files, targets, reason, preserve, false).map(|(removed, _)| removed)
+    ban_with(store, files, targets, reason, preserve, false, protected).map(|(gone, _)| gone)
 }
 
 /// `ban_in`, and with `uploaders`, the owners of the blobs named too (see
@@ -55,9 +71,10 @@ fn ban_with(
     reason: &str,
     preserve: Option<&Path>,
     uploaders: bool,
+    protected: &Protected,
 ) -> Result<(Vec<Record>, usize)> {
     let mut txn = store.write_txn()?;
-    let (doomed, found) = ban_txn_with(
+    let done = ban_txn_with(
         store,
         files,
         &mut txn,
@@ -66,29 +83,33 @@ fn ban_with(
         preserve,
         now(),
         uploaders,
+        protected,
     )?;
     txn.commit()?;
-    let mut removed = Vec::with_capacity(doomed.len());
-    for (seq, rec) in doomed {
+    let mut gone = Vec::with_capacity(done.removed.len() + done.suspended.len());
+    for (seq, rec) in done.removed {
         files.remove(seq, &rec.hash)?;
         crate::info!("removed", "blob": rec.hash.hex(), "size": rec.size);
-        removed.push(rec);
+        gone.push(rec);
     }
-    Ok((removed, found))
+    gone.extend(done.suspended);
+    Ok((gone, done.uploaders))
 }
 
 /// Ban blobs as child sexual abuse material, with everyone who uploaded
-/// them and any `accounts` named besides, keeping a copy of each blob it
-/// removes in `dir` first (see `ban_in`): those accounts' other blobs are
-/// kept as its context. A blob that isn't stored is banned all the same,
-/// so it can't be uploaded, with nothing to keep. The records of the blobs
-/// removed, and how many uploaders were banned.
+/// them (but protected keys) and any `accounts` named besides, keeping a
+/// copy of each blob it removes in `dir` first (see `ban_in`). Those
+/// accounts' other blobs are suspended, and recorded there as its context.
+/// A blob that isn't stored is banned all the same, so it can't be
+/// uploaded, with nothing to keep. The records of the blobs removed or
+/// suspended, and how many uploaders were banned.
 pub fn ban_csam(
     store: &Store,
     files: &Files,
     hashes: &[Hash],
     accounts: &[[u8; 32]],
     dir: &Path,
+    protected: &Protected,
 ) -> Result<(Vec<Record>, usize)> {
     if hashes.is_empty() {
         bail!("CSAM is banned by the blob that's CSAM");
@@ -99,7 +120,7 @@ pub fn ban_csam(
         .map(Banned::Blob)
         .chain(accounts.iter().copied().map(Banned::Pubkey))
         .collect();
-    ban_with(store, files, &targets, "CSAM", Some(dir), true)
+    ban_with(store, files, &targets, "CSAM", Some(dir), true, protected)
 }
 
 /// Take blobs out entirely, whoever owns them, without banning them. The
@@ -134,10 +155,20 @@ fn private(path: &Path) -> Result<std::fs::File> {
         .open(path)?)
 }
 
-/// A ban's work within `txn`: the blobs it takes out are returned, their
-/// files for the caller to remove once it commits. Everything is found and
-/// preserved before anything is written, so if a copy fails, `txn` is as it
-/// was, and can be committed with whatever else it holds.
+/// What a ban did: the blobs it removed, their files for the caller to
+/// remove once it commits; those it suspended; how many uploaders of the
+/// named blobs it found and banned.
+pub struct Done {
+    pub removed: Vec<(u64, Record)>,
+    pub suspended: Vec<Record>,
+    pub uploaders: usize,
+}
+
+/// A ban's work within `txn` (see `Done`). Everything is found and
+/// preserved before anything is written, so if a copy fails, or a protected
+/// key is named, `txn` is as it was, and can be committed with whatever
+/// else it holds.
+#[allow(clippy::too_many_arguments)]
 pub fn ban_txn(
     store: &Store,
     files: &Files,
@@ -146,13 +177,16 @@ pub fn ban_txn(
     reason: &str,
     preserve: Option<&Path>,
     at: u64,
-) -> Result<Vec<(u64, Record)>> {
-    ban_txn_with(store, files, txn, targets, reason, preserve, at, false).map(|(doomed, _)| doomed)
+    protected: &Protected,
+) -> Result<Done> {
+    ban_txn_with(
+        store, files, txn, targets, reason, preserve, at, false, protected,
+    )
 }
 
-/// `ban_txn`, and with `uploaders`, the owners of the blobs named too, found
-/// in the same transaction, so none who uploads one meanwhile is missed.
-/// And how many uploaders that was.
+/// `ban_txn`, and with `uploaders`, the owners of the blobs named too (but
+/// protected ones), found in the same transaction, so none who uploads one
+/// meanwhile is missed.
 #[allow(clippy::too_many_arguments)]
 fn ban_txn_with(
     store: &Store,
@@ -163,7 +197,18 @@ fn ban_txn_with(
     preserve: Option<&Path>,
     at: u64,
     uploaders: bool,
-) -> Result<(Vec<(u64, Record)>, usize)> {
+    protected: &Protected,
+) -> Result<Done> {
+    for t in targets {
+        if let Banned::Pubkey(pk) = t
+            && protected.contains(pk)
+        {
+            bail!(
+                "{} is protected (in protected or upload.exempt): take it out of the config to ban it",
+                hex::encode(pk)
+            );
+        }
+    }
     if let Some(dir) = preserve {
         std::fs::DirBuilder::new()
             .recursive(true)
@@ -187,7 +232,13 @@ fn ban_txn_with(
     if uploaders {
         for hash in &flagged {
             if let Some(seq) = store.seq_of(txn, hash)? {
-                found.extend(store.owners_of(txn, seq)?);
+                for pk in store.owners_of(txn, seq)? {
+                    if protected.contains(&pk) {
+                        crate::info!("ban_spared_protected", "pubkey": hex::encode(pk), "blob": hash.hex());
+                    } else {
+                        found.insert(pk);
+                    }
+                }
             }
         }
         for pk in &found {
@@ -203,9 +254,10 @@ fn ban_txn_with(
             Banned::Blob(_) => None,
         })
         .collect();
-    // Removed and banned; and kept, with the banned uploaders taken off.
+    // Removed and banned: the blobs named. Suspended: an uploader's others
+    // that no one else, unbanned, owns. The rest stay as they are.
     let mut doomed: BTreeMap<u64, Record> = BTreeMap::new();
-    let mut disowned: BTreeMap<u64, Record> = BTreeMap::new();
+    let mut suspend: BTreeMap<u64, Record> = BTreeMap::new();
     for target in &targets {
         let seqs = match target {
             Banned::Blob(h) => store.seq_of(txn, h)?.into_iter().collect(),
@@ -216,45 +268,26 @@ fn ban_txn_with(
             let Some(rec) = store.record(txn, seq)? else {
                 continue;
             };
-            let named = matches!(target, Banned::Blob(_));
+            if matches!(target, Banned::Blob(_)) {
+                doomed.insert(seq, rec);
+                continue;
+            }
             let others = store
                 .owners_of(txn, seq)?
                 .iter()
                 .any(|o| !banned.contains(o));
-            if named || !others {
-                doomed.insert(seq, rec);
-            } else {
-                disowned.insert(seq, rec);
+            if !others && !rec.has(flag::SUSPENDED) {
+                suspend.insert(seq, rec);
             }
         }
     }
-    disowned.retain(|seq, _| !doomed.contains_key(seq));
-    // Each blob's owners, only the banned ones unless it's named, and why.
-    let mut each = Vec::with_capacity(doomed.len() + disowned.len());
-    for (seq, rec) in doomed.iter().chain(&disowned) {
-        let owners: Vec<[u8; 32]> = store
-            .owners_of(txn, *seq)?
-            .into_iter()
-            .filter(|o| flagged.contains(&rec.hash) || banned.contains(o))
-            .collect();
-        let why = if flagged.contains(&rec.hash) {
-            reason.to_string()
-        } else {
-            match reason {
-                "" => "uploader banned".to_string(),
-                r => format!("uploader banned: {r}"),
-            }
-        };
-        each.push((*seq, rec, owners, why));
-    }
+    suspend.retain(|seq, _| !doomed.contains_key(seq));
     if let Some(dir) = preserve {
-        for (seq, rec, owners, why) in &each {
+        // A copy of each blob removed; a record of each, and of each
+        // suspended one, which stays where it is.
+        for (seq, rec) in &doomed {
+            let owners = store.owners_of(txn, *seq)?;
             let reports = store.reports_of(txn, &rec.hash)?;
-            let context_of: &[Hash] = if flagged.contains(&rec.hash) {
-                &[]
-            } else {
-                &flagged
-            };
             let copied = match store.body(txn, *seq)? {
                 Some(b) => keep(dir, &rec.hash, &mut &b[..]),
                 None => blobs::open_noatime(&files.path(&rec.hash, false))
@@ -262,8 +295,22 @@ fn ban_txn_with(
                     .and_then(|mut f| keep(dir, &rec.hash, &mut f)),
             };
             copied
-                .and_then(|()| record(dir, rec, owners, &reports, at, why, context_of))
+                .and_then(|()| record(dir, rec, &owners, &reports, at, reason, &[], false))
                 .with_context(|| format!("Could not preserve {}", rec.hash.hex()))?;
+        }
+        let why = match reason {
+            "" => "uploader banned".to_string(),
+            r => format!("uploader banned: {r}"),
+        };
+        for (seq, rec) in &suspend {
+            let owners: Vec<[u8; 32]> = store
+                .owners_of(txn, *seq)?
+                .into_iter()
+                .filter(|o| banned.contains(o))
+                .collect();
+            let reports = store.reports_of(txn, &rec.hash)?;
+            record(dir, rec, &owners, &reports, at, &why, &flagged, true)
+                .with_context(|| format!("Could not record {}", rec.hash.hex()))?;
         }
         // The copies' names, as well as their bytes, survive a crash.
         std::fs::File::open(dir)?.sync_all()?;
@@ -271,18 +318,24 @@ fn ban_txn_with(
     for target in &targets {
         store.ban(txn, &entry_for(*target, at, reason))?;
     }
-    for (seq, rec, owners, why) in &each {
-        if doomed.contains_key(seq) {
-            store.ban(txn, &entry_for(Banned::Blob(rec.hash), at, why))?;
-            store.remove(txn, *seq, rec)?;
-        } else {
-            for pk in owners {
-                store.remove_owner(txn, *seq, rec.uploaded, pk)?;
-            }
-            crate::info!("disowned", "blob": rec.hash.hex(), "owners": owners.len());
-        }
+    for (seq, rec) in &doomed {
+        store.ban(txn, &entry_for(Banned::Blob(rec.hash), at, reason))?;
+        store.remove(txn, *seq, rec)?;
     }
-    Ok((doomed.into_iter().collect(), found.len()))
+    let mut suspended = Vec::with_capacity(suspend.len());
+    for (seq, mut rec) in suspend {
+        rec.flags |= flag::SUSPENDED;
+        store.update(txn, seq, &rec)?;
+        suspended.push(rec);
+    }
+    if !suspended.is_empty() {
+        crate::info!("suspended", "blobs": suspended.len());
+    }
+    Ok(Done {
+        removed: doomed.into_iter().collect(),
+        suspended,
+        uploaders: found.len(),
+    })
 }
 
 /// Copy a blob's bytes to `dir/<sha256>`, only its owner able to read it,
@@ -312,6 +365,7 @@ pub fn keep(dir: &Path, hash: &Hash, from: &mut impl Read) -> Result<()> {
 /// the removal takes its owners with it, and a report needs them. A blob
 /// kept only as context, as another of an uploader's, names the blobs
 /// banned (`context_of`).
+#[allow(clippy::too_many_arguments)]
 fn record(
     dir: &Path,
     rec: &Record,
@@ -320,6 +374,7 @@ fn record(
     at: u64,
     reason: &str,
     context_of: &[Hash],
+    suspended: bool,
 ) -> Result<()> {
     let reports: Vec<serde_json::Value> = reports
         .iter()
@@ -338,6 +393,8 @@ fn record(
         "banned": at,
         "reason": reason,
         "context_of": context_of.iter().map(Hash::hex).collect::<Vec<_>>(),
+        // Not copied here: it's kept, hidden, where it was.
+        "suspended": suspended,
     });
     write_record(&dir.join(format!("{}.json", rec.hash.hex())), &json)
 }
@@ -445,19 +502,43 @@ pub fn expire(dir: &Path, now: u64) -> Result<Vec<String>> {
     Ok(gone)
 }
 
-/// Lift bans. An uploader's blobs, banned with it, stay banned.
+/// Lift bans. An uploader's suspended blobs come back, unless another of
+/// their owners is still banned; the blobs named in its ban stay banned.
 pub fn unban(config: &Config, targets: &[Banned]) -> Result<()> {
-    unban_in(&Store::open(&config.data)?, targets)
+    unban_in(&Store::open(&config.data)?, targets).map(|_| ())
 }
 
-pub fn unban_in(store: &Store, targets: &[Banned]) -> Result<()> {
+/// How many blobs came back.
+pub fn unban_in(store: &Store, targets: &[Banned]) -> Result<usize> {
     let mut txn = store.write_txn()?;
+    let mut back = 0;
     for target in targets {
         let was = store.unban(&mut txn, target)?;
-        crate::info!("unbanned", "target": describe(target), "was_banned": was);
+        let mut n = 0;
+        if let Banned::Pubkey(pk) = target {
+            for seq in store.owned(&txn, pk)? {
+                let Some(mut rec) = store.record(&txn, seq)? else {
+                    continue;
+                };
+                if !rec.has(flag::SUSPENDED) {
+                    continue;
+                }
+                let mut still = false;
+                for o in store.owners_of(&txn, seq)? {
+                    still |= store.banned(&txn, None, Some(&o))?;
+                }
+                if !still {
+                    rec.flags &= !flag::SUSPENDED;
+                    store.update(&mut txn, seq, &rec)?;
+                    n += 1;
+                }
+            }
+        }
+        crate::info!("unbanned", "target": describe(target), "was_banned": was, "unsuspended": n);
+        back += n;
     }
     txn.commit()?;
-    Ok(())
+    Ok(back)
 }
 
 /// Every ban, a line each: `blob|pubkey <hex> <unix seconds> <reason>`.
@@ -506,7 +587,7 @@ mod tests {
                 br_size: 0,
             };
             std::fs::write(dir.path().join(h.hex()), b"x").unwrap();
-            record(dir.path(), &rec, &[], &[], 0, "CSAM", &[]).unwrap();
+            record(dir.path(), &rec, &[], &[], 0, "CSAM", &[], false).unwrap();
         }
         reported(dir.path(), &a, "123", 1000).unwrap();
         assert!(expire(dir.path(), 1000 + KEEP_FOR - 1).unwrap().is_empty());

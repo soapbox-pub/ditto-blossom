@@ -44,6 +44,11 @@ pub struct Config {
     pub scan: Scan,
     #[serde(default)]
     pub admin: Admin,
+    /// Pubkeys, hex, no ban may name: not `ban --pubkey`, the dashboard, or
+    /// a scan match, which takes only the blob. For keys that upload for
+    /// many people, like a server's (upload.exempt keys are protected too).
+    #[serde(default, deserialize_with = "pubkeys")]
+    pub protected: HashSet<[u8; 32]>,
 }
 
 /// The admin dashboard, on a listener of its own (see `admin`).
@@ -353,6 +358,11 @@ impl Default for Report {
 }
 
 impl Config {
+    /// Keys no ban may name: `protected`, and `upload.exempt`.
+    pub fn protected(&self) -> HashSet<[u8; 32]> {
+        self.protected.union(&self.upload.exempt).copied().collect()
+    }
+
     pub fn load(path: &Path) -> Result<Config> {
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("Could not read {}", path.display()))?;

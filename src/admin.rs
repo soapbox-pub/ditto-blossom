@@ -893,7 +893,9 @@ async fn ban(app: &'static App, admin: [u8; 32], body: &[u8]) -> Answer {
     let reason = t.reason.trim().to_string();
     let (blobs, pubkeys) = (t.blobs.len(), t.pubkeys.len());
     let (removed, reason) = tokio::task::spawn_blocking(move || {
-        crate::moderate::ban_in(app.store, app.files, &targets, &reason, None).map(|r| (r, reason))
+        let protected = app.config.protected();
+        crate::moderate::ban_in(app.store, app.files, &targets, &reason, None, &protected)
+            .map(|r| (r, reason))
     })
     .await
     .map_err(|e| Failure::Internal(e.into()))??;
@@ -928,8 +930,14 @@ async fn csam(app: &'static App, admin: [u8; 32], body: &[u8]) -> Answer {
     let (hash, _) = one_hash(body)?;
     let dir = app.config.evidence();
     let (removed, uploaders, unlearned) = tokio::task::spawn_blocking(move || {
-        let (removed, uploaders) =
-            crate::moderate::ban_csam(app.store, app.files, &[hash], &[], &dir)?;
+        let (removed, uploaders) = crate::moderate::ban_csam(
+            app.store,
+            app.files,
+            &[hash],
+            &[],
+            &dir,
+            &app.config.protected(),
+        )?;
         // Nothing it banned stays in what the scanner is trained on.
         let mut gone: Vec<String> = removed.iter().map(|r| r.hash.hex()).collect();
         gone.push(hash.hex());
@@ -1003,11 +1011,11 @@ async fn reported(app: &'static App, admin: [u8; 32], body: &[u8]) -> Answer {
 async fn unban(app: &'static App, admin: [u8; 32], body: &[u8]) -> Answer {
     let (t, targets) = Targets::parse(body)?;
     let (blobs, pubkeys) = (t.blobs.len(), t.pubkeys.len());
-    tokio::task::spawn_blocking(move || crate::moderate::unban_in(app.store, &targets))
+    let back = tokio::task::spawn_blocking(move || crate::moderate::unban_in(app.store, &targets))
         .await
         .map_err(|e| Failure::Internal(e.into()))??;
-    crate::info!("admin_unban", "admin": hex::encode(admin), "blobs": blobs, "pubkeys": pubkeys);
-    Ok(json!({}))
+    crate::info!("admin_unban", "admin": hex::encode(admin), "blobs": blobs, "pubkeys": pubkeys, "unsuspended": back);
+    Ok(json!({ "unsuspended": back }))
 }
 
 /// Blobs a page of the media view holds, and the most records one request
