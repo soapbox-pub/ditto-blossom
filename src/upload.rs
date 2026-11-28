@@ -297,24 +297,31 @@ pub async fn store(
                 unasked = true;
             }
             Checked::Matched(pdq, verdict) => {
-                let source = Source::of_ingested(&blob);
-                let m = Match {
-                    hash,
-                    size,
-                    mime: blob.mime.as_deref(),
-                    pdq,
-                    verdict,
-                    via: how,
-                    owners: owner.into_iter().collect(),
-                    ip: Some(ip),
-                    uploaded: None,
-                };
-                if let Err(e) = scanner
-                    .on_match(m, Some(&source), Banner::Writer(&app.writer))
-                    .await
-                {
-                    crate::error!("scan_match_failed", "blob": hash.hex(), "error": format!("{e:#}"));
-                }
+                // A task of its own, holding the blob, so the uploader
+                // hanging up can't stop it halfway: preserved, banned,
+                // recorded and alerted, however long the writer takes.
+                let how = how.to_string();
+                let dealt = tokio::spawn(async move {
+                    let source = Source::of_ingested(&blob);
+                    let m = Match {
+                        hash,
+                        size,
+                        mime: blob.mime.as_deref(),
+                        pdq,
+                        verdict,
+                        via: &how,
+                        owners: owner.into_iter().collect(),
+                        ip: Some(ip),
+                        uploaded: None,
+                    };
+                    if let Err(e) = scanner
+                        .on_match(m, Some(&source), Banner::Writer(&app.writer))
+                        .await
+                    {
+                        crate::error!("scan_match_failed", "blob": hash.hex(), "error": format!("{e:#}"));
+                    }
+                });
+                let _ = dealt.await;
                 return error(StatusCode::FORBIDDEN, BANNED);
             }
         }
