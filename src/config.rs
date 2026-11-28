@@ -44,6 +44,54 @@ pub struct Config {
     pub scan: Scan,
     #[serde(default)]
     pub admin: Admin,
+    #[serde(default)]
+    pub moderation: Moderation,
+}
+
+/// Bans and unbans shared with other servers (see `peers`): each serves
+/// its own, and follows its peers', the latest decision on a blob or a
+/// pubkey winning wherever it was made.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Moderation {
+    /// A file of tokens, a line each, that peers read this server's
+    /// decisions with (`GET /moderation/decisions`). Unset: none may.
+    #[serde(default)]
+    pub tokens_file: Option<PathBuf>,
+    /// Servers whose decisions this one follows.
+    #[serde(default)]
+    pub peers: Vec<Peer>,
+    /// Seconds between reads of each peer's decisions.
+    #[serde(default = "default_pull_every")]
+    pub pull_every: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Peer {
+    /// Its `public_url`.
+    pub url: String,
+    /// A file holding the token it gave this server, readable by the
+    /// server alone.
+    pub token_file: PathBuf,
+    /// Its bans whose reasons start with one of these aren't followed,
+    /// like `"scan:"` for those its explicit-media scanner made.
+    #[serde(default)]
+    pub skip: Vec<String>,
+}
+
+fn default_pull_every() -> u64 {
+    60
+}
+
+impl Default for Moderation {
+    fn default() -> Moderation {
+        Moderation {
+            tokens_file: None,
+            peers: Vec::new(),
+            pull_every: default_pull_every(),
+        }
+    }
 }
 
 /// The admin dashboard, on a listener of its own (see `admin`).
@@ -407,6 +455,12 @@ impl Config {
         }
         if let Some(bad) = config.admin.relays().iter().find(|r| !plain_relay(r)) {
             bail!("admin.relays: {bad:?} isn't a wss:// URL");
+        }
+        for peer in &mut config.moderation.peers {
+            peer.url = peer.url.trim_end_matches('/').to_string();
+            if !(peer.url.starts_with("https://") || peer.url.starts_with("http://")) {
+                bail!("moderation.peers: {:?} isn't a server's URL", peer.url);
+            }
         }
         Ok(config)
     }

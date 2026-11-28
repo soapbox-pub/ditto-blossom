@@ -36,6 +36,8 @@ pub struct App {
     pub shield: Option<crate::scan::known::Scanner>,
     /// Admins signed in to the dashboard.
     pub admin: crate::admin::Sessions,
+    /// Servers moderation is shared with.
+    pub peers: crate::peers::Peers,
 }
 
 impl App {
@@ -101,6 +103,7 @@ impl App {
         let compressor = Compressor::start(store, files, writer.clone(), workers);
         let http = crate::mirror::client(config.mirror.allow_private);
         let shield = crate::scan::known::Scanner::open(&config)?;
+        let peers = crate::peers::Peers::open(&config)?;
         let scanner = if config.scan.refuses() {
             Some(crate::scan::Scanner::start(&config.scan)?)
         } else {
@@ -124,6 +127,7 @@ impl App {
             scanner,
             shield,
             admin: Default::default(),
+            peers,
         }));
         crate::scan::Scanner::start_background(app);
         Ok(app)
