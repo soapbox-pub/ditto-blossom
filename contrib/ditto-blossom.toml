@@ -93,3 +93,12 @@ hold = true              # with background: don't serve a blob until it's scanne
 # cdn = "Cloudflare"     # the cache in front of public_url, if any: what to purge from it
 # labels = "/var/lib/ditto-blossom/labels.json"     # train --labels, added to
 # embeddings = "/var/lib/ditto-blossom/embeddings.jsonl"  # train --cache, added to
+
+# Bans and unbans shared with other servers (see the README). Unset: none.
+[moderation]
+# tokens_file = "/etc/ditto-blossom-moderation-tokens"   # a line each, for peers to read with
+pull_every = 60
+# [[moderation.peers]]
+# url = "https://blossom.example.org"
+# token_file = "/etc/ditto-blossom-peer-example"   # the token it gave this server
+# skip = ["scan:"]   # don't follow bans whose reasons start with these

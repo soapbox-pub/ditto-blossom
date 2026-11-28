@@ -134,6 +134,36 @@ place and given back to the owners its `<sha256>.json` names, or
 `--owner`, and its copy removed. `--except` leaves the blobs it names, the
 ones really banned, where they are.
 
+### Sharing bans with other servers
+
+Servers can follow each other's bans and unbans, however they were made:
+`ban`, the dashboard, Shield or the explicit-media scanner.
+
+```toml
+[moderation]
+# Tokens, a line each (32+ characters), that peers read this server's
+# decisions with.
+tokens_file = "/etc/ditto-blossom-moderation-tokens"
+pull_every = 60
+
+[[moderation.peers]]
+url = "https://blossom.example.org"
+token_file = "/etc/ditto-blossom-peer-example"   # the token it gave you
+skip = ["scan:"]   # don't follow bans whose reasons start with these
+```
+
+A peer's ban is carried out as one made here: what's stored of it is
+deleted, a CSAM ban's preserved first in `admin.preserve`, and a banned
+pubkey taken off blobs others own too. Keys in `upload.exempt` aren't
+banned. For each blob or pubkey, the latest decision wins, wherever it
+was made, so an unban on either server lifts the ban on both, and
+decisions coming back from a peer change nothing. `skip = ["scan:"]`
+leaves out the explicit-media scanner's refusals, for a server that
+doesn't refuse explicit media itself.
+
+Decisions are served at `GET /moderation/decisions` to holders of a token,
+with `Cache-Control: no-store`.
+
 ## Admin dashboard
 
 ```toml

@@ -17,7 +17,14 @@
 //! - `reports`: sha256 then the report's event id -> its JSON.
 //! - `banned_blobs`: sha256 -> [`Ban`]: never stored again, whoever sends it.
 //! - `banned_pubkeys`: pubkey -> [`Ban`]: owns nothing new.
-//! - `info`: `version` -> the layout's version.
+//! - `unbans`: kind (0 blob, 1 pubkey) then hash or pubkey -> when its ban
+//!   was lifted (u64 LE): a decision, as much as a ban is.
+//! - `decisions`: when (u64 BE), kind, hash or pubkey -> 1 for a ban, 0 for
+//!   an unban: every target's latest, in order of when, for peers to follow
+//!   (see `peers`).
+//! - `info`: `version` -> the layout's version; `decisions` -> `2` once
+//!   they've been made to agree with the bans here (see `reconcile_decisions`); `peer:<url>` -> how far into that
+//!   peer's decisions this server has read.
 //! - `bodies`: seq -> the bytes of a blob up to [`INLINE_MAX`].
 //! - `brotli`: seq -> a brotli copy up to [`INLINE_MAX`].
 //! - `access` (stats): seq -> the day (u16 LE, since the epoch) it was last read.
@@ -125,6 +132,141 @@ fn stamp_parts(s: &[u8]) -> (u64, u64) {
     (uploaded, u64::from_be_bytes(seq))
 }
 
+const BLOB: u8 = 0;
+const PUBKEY: u8 = 1;
+
+/// A ban or unban, as `decisions` keeps it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Decision {
+    /// Its key in `decisions`, to read on from.
+    pub cursor: Vec<u8>,
+    pub target: Banned,
+    pub at: u64,
+    /// The ban, or `None` for an unban.
+    pub ban: Option<Ban>,
+}
+
+fn target_key(target: &Banned) -> [u8; 33] {
+    let mut k = [0; 33];
+    match target {
+        Banned::Blob(h) => k[1..].copy_from_slice(&h.0),
+        Banned::Pubkey(pk) => {
+            k[0] = PUBKEY;
+            k[1..].copy_from_slice(pk);
+        }
+    }
+    k
+}
+
+fn decision_key(at: u64, target: &Banned) -> Vec<u8> {
+    let t = target_key(target);
+    decision_key_of(at, t[0], &t[1..])
+}
+
+fn decision_key_of(at: u64, kind: u8, key: &[u8]) -> Vec<u8> {
+    let mut k = at.to_be_bytes().to_vec();
+    k.push(kind);
+    k.extend_from_slice(key);
+    k
+}
+
+fn parse_decision_key(k: &[u8]) -> Option<(u64, Banned)> {
+    if k.len() != 41 {
+        return None;
+    }
+    let at = u64::from_be_bytes(k[..8].try_into().ok()?);
+    let key: [u8; 32] = k[9..].try_into().ok()?;
+    let target = match k[8] {
+        BLOB => Banned::Blob(Hash(key)),
+        PUBKEY => Banned::Pubkey(key),
+        _ => return None,
+    };
+    Some((at, target))
+}
+
+/// Make `decisions` agree with the bans here, once: a ban without its
+/// decision gets one, as `fill_decisions` gives those from before decisions
+/// were kept; and a ban decision whose ban is gone, lifted by a build that
+/// didn't keep decisions, becomes an unban, `now`, so peers lift it too.
+/// Peers can't read decisions that don't agree.
+fn reconcile_decisions(
+    txn: &mut RwTxn<'_>,
+    banned: [Db; 2],
+    unbans: Db,
+    decisions: Db,
+    now: u64,
+) -> Result<()> {
+    let ban_at = |txn: &RwTxn<'_>, target: &Banned| -> Result<Option<u64>> {
+        let (db, key) = match target {
+            Banned::Blob(h) => (banned[0], &h.0[..]),
+            Banned::Pubkey(pk) => (banned[1], &pk[..]),
+        };
+        Ok(txn
+            .get(db, key)?
+            .and_then(|v| v.get(..8)?.try_into().ok())
+            .map(u64::from_le_bytes))
+    };
+    let mut stale: Vec<(Vec<u8>, Banned, bool)> = Vec::new();
+    {
+        let mut cur = txn.cursor(decisions)?;
+        let mut e = cur.first()?;
+        while let Some((k, v)) = e {
+            let (at, target) = parse_decision_key(k).context("A decision is corrupt")?;
+            let current = ban_at(txn, &target)?;
+            let ok = match v {
+                [1] => current == Some(at),
+                _ => current.is_none(),
+            };
+            if !ok {
+                stale.push((k.to_vec(), target, v == [1]));
+            }
+            e = cur.next()?;
+        }
+    }
+    let mut lifted = 0;
+    for (k, target, was_ban) in &stale {
+        txn.del(decisions, k, None)?;
+        let tk = target_key(target);
+        if *was_ban && ban_at(txn, target)?.is_none() {
+            txn.put(unbans, &tk, &now.to_le_bytes())?;
+            txn.put(decisions, &decision_key(now, target), &[0])?;
+            lifted += 1;
+        } else if !*was_ban {
+            // Banned again since, by a build that didn't keep decisions.
+            txn.del(unbans, &tk, None)?;
+        }
+    }
+    let before = txn.len(decisions)?;
+    fill_decisions(txn, banned, decisions)?;
+    let filled = txn.len(decisions)? - before;
+    if !stale.is_empty() || filled > 0 {
+        crate::info!("decisions_reconciled", "stale": stale.len(), "lifted": lifted, "filled": filled);
+    }
+    Ok(())
+}
+
+/// Bans from before decisions were kept, as decisions.
+fn fill_decisions(txn: &mut RwTxn<'_>, banned: [Db; 2], decisions: Db) -> Result<()> {
+    let mut keys = Vec::new();
+    for (db, kind) in banned.into_iter().zip([BLOB, PUBKEY]) {
+        let mut cur = txn.cursor(db)?;
+        let mut e = cur.first()?;
+        while let Some((k, v)) = e {
+            let at = u64::from_le_bytes(
+                v.get(..8)
+                    .and_then(|b| b.try_into().ok())
+                    .context("A ban is corrupt")?,
+            );
+            keys.push(decision_key_of(at, kind, k));
+            e = cur.next()?;
+        }
+    }
+    for k in &keys {
+        txn.put(decisions, k, &[1])?;
+    }
+    Ok(())
+}
+
 /// What's banned: a blob, by its hash, or an uploader.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Banned {
@@ -182,6 +324,9 @@ pub struct Store {
     banned_pubkeys: Db,
     /// Blobs kept while Shield couldn't be asked about them: hash → when.
     unscanned: Db,
+    unbans: Db,
+    decisions: Db,
+    info: Db,
     bodies: Db,
     brotli: Db,
     access: Db,
@@ -224,12 +369,13 @@ impl Store {
         let banned_blobs = env.create_db("banned_blobs", DbFlags::PLAIN)?;
         let banned_pubkeys = env.create_db("banned_pubkeys", DbFlags::PLAIN)?;
         let unscanned = env.create_db("unscanned", DbFlags::PLAIN)?;
+        let unbans = env.create_db("unbans", DbFlags::PLAIN)?;
+        let decisions = env.create_db("decisions", DbFlags::PLAIN)?;
         {
             let mut txn = env.write_txn()?;
             match txn.get(info, b"version")? {
                 None => {
                     txn.put(info, b"version", VERSION)?;
-                    txn.commit()?;
                 }
                 Some(v) if v == VERSION => {}
                 Some(v) => bail!(
@@ -238,6 +384,17 @@ impl Store {
                     String::from_utf8_lossy(VERSION)
                 ),
             }
+            if txn.get(info, b"decisions")? != Some(b"2") {
+                reconcile_decisions(
+                    &mut txn,
+                    [banned_blobs, banned_pubkeys],
+                    unbans,
+                    decisions,
+                    crate::upload::now(),
+                )?;
+                txn.put(info, b"decisions", b"2")?;
+            }
+            txn.commit()?;
         }
         let (stats, access) = open_stats(&dir.join("stats"))?;
         let (blobs, ids, owners, blob_owners, reports, bodies, brotli) = store_env_tables;
@@ -252,6 +409,9 @@ impl Store {
             banned_blobs,
             banned_pubkeys,
             unscanned,
+            unbans,
+            decisions,
+            info,
             bodies,
             brotli,
             access,
@@ -595,15 +755,110 @@ impl Store {
     }
 
     pub fn ban(&self, txn: &mut RwTxn<'_>, ban: &Ban) -> Result<()> {
+        self.forget_decision(txn, &ban.target)?;
         let (db, key) = self.ban_key(&ban.target);
         txn.put(db, key, &ban.encode())?;
+        txn.put(self.decisions, &decision_key(ban.at, &ban.target), &[1])?;
         Ok(())
     }
 
-    /// Whether it was banned.
+    /// Lift a ban now. Whether it was banned.
     pub fn unban(&self, txn: &mut RwTxn<'_>, target: &Banned) -> Result<bool> {
+        self.unban_at(txn, target, crate::upload::now())
+    }
+
+    /// Lift a ban, as decided `at`. Whether it was banned.
+    pub fn unban_at(&self, txn: &mut RwTxn<'_>, target: &Banned, at: u64) -> Result<bool> {
+        if self.ban_of(txn, *target)?.is_none() {
+            return Ok(false);
+        }
+        self.forget_decision(txn, target)?;
         let (db, key) = self.ban_key(target);
-        Ok(txn.del(db, key, None)?)
+        txn.del(db, key, None)?;
+        txn.put(self.unbans, &target_key(target), &at.to_le_bytes())?;
+        txn.put(self.decisions, &decision_key(at, target), &[0])?;
+        Ok(true)
+    }
+
+    /// When a target was last banned or unbanned, if it ever was.
+    pub fn decided_at(&self, txn: &Txn<'_>, target: Banned) -> Result<Option<u64>> {
+        if let Some(b) = self.ban_of(txn, target)? {
+            return Ok(Some(b.at));
+        }
+        Ok(txn
+            .get(self.unbans, &target_key(&target))?
+            .and_then(|v| v.try_into().ok())
+            .map(u64::from_le_bytes))
+    }
+
+    /// Take a target's latest decision out of `decisions`, and its unban
+    /// out of `unbans`, before another replaces it.
+    fn forget_decision(&self, txn: &mut RwTxn<'_>, target: &Banned) -> Result<()> {
+        if let Some(old) = self.ban_of(txn, *target)? {
+            txn.del(self.decisions, &decision_key(old.at, target), None)?;
+        }
+        let tk = target_key(target);
+        let unbanned: Option<u64> = txn
+            .get(self.unbans, &tk)?
+            .and_then(|v| v.try_into().ok())
+            .map(u64::from_le_bytes);
+        if let Some(at) = unbanned {
+            txn.del(self.decisions, &decision_key(at, target), None)?;
+            txn.del(self.unbans, &tk, None)?;
+        }
+        Ok(())
+    }
+
+    /// Up to `limit` decisions, oldest first, after the one `after` names
+    /// (its `cursor`), or from the first. And whether there are more.
+    pub fn decisions(
+        &'static self,
+        after: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<(Vec<Decision>, bool)> {
+        self.read(|txn| -> Result<(Vec<Decision>, bool)> {
+            let mut cur = txn.cursor(self.decisions)?;
+            let mut e = match after {
+                Some(k) => match cur.set_range(k)? {
+                    Some((found, _)) if found == k => cur.next()?,
+                    other => other,
+                },
+                None => cur.first()?,
+            };
+            let mut out = Vec::new();
+            while let Some((k, v)) = e {
+                if out.len() == limit {
+                    return Ok((out, true));
+                }
+                let (at, target) = parse_decision_key(k).context("A decision is corrupt")?;
+                let ban = match v {
+                    [1] => Some(
+                        self.ban_of(txn, target)?
+                            .context("A ban decided without its ban")?,
+                    ),
+                    _ => None,
+                };
+                out.push(Decision {
+                    cursor: k.to_vec(),
+                    target,
+                    at,
+                    ban,
+                });
+                e = cur.next()?;
+            }
+            Ok((out, false))
+        })?
+    }
+
+    /// How far into a peer's decisions this server has read.
+    pub fn peer_cursor(&'static self, url: &str) -> Result<Option<Vec<u8>>> {
+        let key = format!("peer:{url}");
+        self.read(|txn| Ok(txn.get(self.info, key.as_bytes())?.map(<[u8]>::to_vec)))?
+    }
+
+    pub fn set_peer_cursor(&self, txn: &mut RwTxn<'_>, url: &str, cursor: &[u8]) -> Result<()> {
+        txn.put(self.info, format!("peer:{url}").as_bytes(), cursor)?;
+        Ok(())
     }
 
     /// A target's ban, if it's banned.
@@ -941,6 +1196,92 @@ mod tests {
         store.touch(&[1, 3], 20_000).unwrap();
         assert_eq!(store.last_read(3).unwrap(), Some(20_000));
         assert_eq!(store.last_read(4).unwrap(), None);
+    }
+
+    #[test]
+    fn each_target_keeps_its_latest_decision() {
+        let (_dir, store) = temp_store();
+        let (blob, pk) = (Banned::Blob(Hash::of(b"x")), Banned::Pubkey([3; 32]));
+        let ban = |target, at| Ban {
+            target,
+            at,
+            reason: format!("at {at}"),
+        };
+        let mut txn = store.write_txn().unwrap();
+        store.ban(&mut txn, &ban(blob, 10)).unwrap();
+        store.ban(&mut txn, &ban(pk, 20)).unwrap();
+        store.ban(&mut txn, &ban(blob, 30)).unwrap();
+        assert!(store.unban_at(&mut txn, &pk, 40).unwrap());
+        assert!(
+            !store.unban_at(&mut txn, &pk, 50).unwrap(),
+            "not banned now"
+        );
+        assert_eq!(store.decided_at(&txn, blob).unwrap(), Some(30));
+        assert_eq!(store.decided_at(&txn, pk).unwrap(), Some(40));
+        assert_eq!(
+            store
+                .decided_at(&txn, Banned::Blob(Hash::of(b"y")))
+                .unwrap(),
+            None
+        );
+        txn.commit().unwrap();
+        let (all, more) = store.decisions(None, 10).unwrap();
+        assert!(!more);
+        let seen: Vec<_> = all
+            .iter()
+            .map(|d| (d.target, d.at, d.ban.is_some()))
+            .collect();
+        assert_eq!(seen, [(blob, 30, true), (pk, 40, false)]);
+        let (rest, _) = store.decisions(Some(&all[0].cursor), 10).unwrap();
+        assert_eq!(rest, all[1..]);
+
+        // Banned again, the unban's forgotten.
+        let mut txn = store.write_txn().unwrap();
+        store.ban(&mut txn, &ban(pk, 60)).unwrap();
+        txn.commit().unwrap();
+        let (all, _) = store.decisions(None, 10).unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[1].ban.as_ref().unwrap().reason, "at 60");
+
+        // Bans from before decisions were kept are found.
+        let mut txn = store.write_txn().unwrap();
+        txn.clear(store.decisions).unwrap();
+        fill_decisions(
+            &mut txn,
+            [store.banned_blobs, store.banned_pubkeys],
+            store.decisions,
+        )
+        .unwrap();
+        txn.commit().unwrap();
+        assert_eq!(store.decisions(None, 10).unwrap().0, all);
+
+        // A ban lifted, and another made, by a build that kept no decisions:
+        // reconciling makes the first an unban, now, and finds the second.
+        let lifted = Banned::Blob(Hash::of(b"lifted"));
+        let mut txn = store.write_txn().unwrap();
+        store.ban(&mut txn, &ban(lifted, 70)).unwrap();
+        let (db, key) = store.ban_key(&lifted);
+        txn.del(db, key, None).unwrap();
+        let (db, key) = store.ban_key(&blob);
+        txn.put(db, key, &ban(blob, 80).encode()).unwrap();
+        reconcile_decisions(
+            &mut txn,
+            [store.banned_blobs, store.banned_pubkeys],
+            store.unbans,
+            store.decisions,
+            90,
+        )
+        .unwrap();
+        txn.commit().unwrap();
+        let (all, _) = store.decisions(None, 10).unwrap();
+        let seen: Vec<_> = all
+            .iter()
+            .map(|d| (d.target, d.at, d.ban.is_some()))
+            .collect();
+        assert_eq!(
+            seen,
+            [(pk, 60, true), (blob, 80, true), (lifted, 90, false)]
+        );
     }
 
     #[test]

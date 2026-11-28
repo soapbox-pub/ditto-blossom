@@ -266,6 +266,7 @@ async fn head_conditional_ranges_and_errors() {
 }
 
 mod admin;
+mod peers;
 mod scan;
 mod scanning;
 mod writes;

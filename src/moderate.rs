@@ -338,6 +338,96 @@ fn ban_txn_with(
     })
 }
 
+/// What following a page of a peer's decisions came to.
+#[derive(Default)]
+pub struct Followed {
+    pub banned: usize,
+    pub unbanned: usize,
+    pub removed: Vec<Record>,
+}
+
+/// Carry out a page of a peer's decisions (see `peers`), each that's newer
+/// than this server's own on its target, as of when the peer made it: a ban
+/// as `ban_in` would, preserving to `evidence` first if it's for CSAM; an
+/// unban as `unban_in`. Not a ban whose reason starts with one of `skip`,
+/// nor a ban of a protected key. In one commit with how far it got.
+#[allow(clippy::too_many_arguments)]
+pub fn follow(
+    store: &Store,
+    files: &Files,
+    decisions: &[crate::store::Decision],
+    peer: &str,
+    skip: &[String],
+    protected: &Protected,
+    evidence: &Path,
+) -> Result<Followed> {
+    let mut txn = store.write_txn()?;
+    let mut out = Followed::default();
+    let mut doomed = Vec::new();
+    for d in decisions {
+        if store
+            .decided_at(&txn, d.target)?
+            .is_some_and(|at| at >= d.at)
+        {
+            continue;
+        }
+        let Some(ban) = &d.ban else {
+            if store.unban_at(&mut txn, &d.target, d.at)? {
+                let back = match d.target {
+                    Banned::Pubkey(pk) => unsuspend(store, &mut txn, &pk)?,
+                    Banned::Blob(_) => 0,
+                };
+                crate::info!("peer_unbanned", "peer": peer, "target": describe(&d.target), "unsuspended": back);
+                out.unbanned += 1;
+            }
+            continue;
+        };
+        if skip.iter().any(|p| ban.reason.starts_with(p.as_str())) {
+            continue;
+        }
+        if let Banned::Pubkey(pk) = d.target
+            && protected.contains(&pk)
+        {
+            crate::info!("peer_ban_protected", "peer": peer, "target": describe(&d.target));
+            continue;
+        }
+        let stored = match d.target {
+            Banned::Blob(h) => store.seq_of(&txn, &h)?.is_some(),
+            Banned::Pubkey(pk) => !store.owned(&txn, &pk)?.is_empty(),
+        };
+        if stored {
+            crate::info!("peer_banned", "peer": peer, "target": describe(&d.target), "reason": ban.reason);
+            let preserve = ban.reason.starts_with("CSAM").then_some(evidence);
+            let done = ban_txn_with(
+                store,
+                files,
+                &mut txn,
+                &[d.target],
+                &ban.reason,
+                preserve,
+                d.at,
+                false,
+                protected,
+            )?;
+            doomed.extend(done.removed);
+            out.removed.extend(done.suspended);
+        } else {
+            store.ban(&mut txn, &entry_for(d.target, d.at, &ban.reason))?;
+        }
+        out.banned += 1;
+    }
+    if let Some(last) = decisions.last() {
+        store.set_peer_cursor(&mut txn, peer, &last.cursor)?;
+    }
+    txn.commit()?;
+    for (seq, rec) in doomed {
+        files.remove(seq, &rec.hash)?;
+        crate::info!("removed", "blob": rec.hash.hex(), "size": rec.size);
+        out.removed.push(rec);
+    }
+    Ok(out)
+}
+
 /// Copy a blob's bytes to `dir/<sha256>`, only its owner able to read it,
 /// durably, and check the copy's hash.
 pub fn keep(dir: &Path, hash: &Hash, from: &mut impl Read) -> Result<()> {
@@ -514,31 +604,39 @@ pub fn unban_in(store: &Store, targets: &[Banned]) -> Result<usize> {
     let mut back = 0;
     for target in targets {
         let was = store.unban(&mut txn, target)?;
-        let mut n = 0;
-        if let Banned::Pubkey(pk) = target {
-            for seq in store.owned(&txn, pk)? {
-                let Some(mut rec) = store.record(&txn, seq)? else {
-                    continue;
-                };
-                if !rec.has(flag::SUSPENDED) {
-                    continue;
-                }
-                let mut still = false;
-                for o in store.owners_of(&txn, seq)? {
-                    still |= store.banned(&txn, None, Some(&o))?;
-                }
-                if !still {
-                    rec.flags &= !flag::SUSPENDED;
-                    store.update(&mut txn, seq, &rec)?;
-                    n += 1;
-                }
-            }
-        }
+        let n = match target {
+            Banned::Pubkey(pk) => unsuspend(store, &mut txn, pk)?,
+            Banned::Blob(_) => 0,
+        };
         crate::info!("unbanned", "target": describe(target), "was_banned": was, "unsuspended": n);
         back += n;
     }
     txn.commit()?;
     Ok(back)
+}
+
+/// Bring back a pubkey's suspended blobs, but those another banned owner
+/// keeps suspended. How many came back.
+fn unsuspend(store: &Store, txn: &mut RwTxn<'_>, pk: &[u8; 32]) -> Result<usize> {
+    let mut n = 0;
+    for seq in store.owned(txn, pk)? {
+        let Some(mut rec) = store.record(txn, seq)? else {
+            continue;
+        };
+        if !rec.has(flag::SUSPENDED) {
+            continue;
+        }
+        let mut still = false;
+        for o in store.owners_of(txn, seq)? {
+            still |= store.banned(txn, None, Some(&o))?;
+        }
+        if !still {
+            rec.flags &= !flag::SUSPENDED;
+            store.update(txn, seq, &rec)?;
+            n += 1;
+        }
+    }
+    Ok(n)
 }
 
 /// Every ban, a line each: `blob|pubkey <hex> <unix seconds> <reason>`.

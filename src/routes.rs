@@ -50,6 +50,7 @@ async fn route(app: &'static App, req: Request<Incoming>, peer: SocketAddr) -> R
         (Method::HEAD, "/upload") => upload::head_upload(app, &req),
         (Method::PUT, "/mirror") => crate::mirror::mirror(app, req, peer).await,
         (Method::PUT, "/report") => upload::report(app, req, peer).await,
+        (Method::GET, "/moderation/decisions") => crate::peers::decisions(app, &req),
         (Method::PUT | Method::HEAD, "/media") => error(
             StatusCode::NOT_FOUND,
             "Media optimization (BUD-05) isn't offered here",

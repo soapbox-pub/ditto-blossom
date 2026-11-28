@@ -20,6 +20,7 @@ mod mime;
 mod mirror;
 mod moderate;
 mod pdq;
+mod peers;
 mod restore;
 mod routes;
 mod scan;
@@ -332,6 +333,7 @@ fn serve(config: Config) -> Result<()> {
         tokio::spawn(flush_access(app, shutdown.clone()));
         tokio::spawn(expire_evidence(app, shutdown.clone()));
         tokio::spawn(stop_on_signal(shutdown.clone()));
+        tokio::spawn(peers::follow(app, shutdown.clone()));
         tokio::spawn(scan::known::retry_unscanned(
             app,
             Duration::from_secs(app.config.scan.retry_every.max(10)),
