@@ -62,8 +62,7 @@ shield_url = "https://shield.projectarachnid.com"
 # username:password from the Shield account page; readable by the server
 # alone. Unset: no Shield.
 # credentials_file = "/etc/ditto-blossom/shield"
-# A directory per match: its blobs and record.json, for the NCMEC report.
-# evidence = "/var/lib/ditto-blossom/scan-matches"
+# Matches are kept in admin.preserve, with the dashboard's CSAM evidence.
 # Run on each match with its record (JSON) on stdin, to tell someone.
 # alert_command = ["/usr/local/bin/alert-csam"]
 # Seconds between tries at blobs kept while Shield couldn't be asked.

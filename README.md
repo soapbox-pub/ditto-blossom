@@ -288,19 +288,18 @@ sends only the hash, so resized and recompressed copies of known images
 match too, and no image leaves the server. JPEG, PNG, WebP, GIF (its first
 frame) and BMP are hashed; video and other formats aren't yet.
 
-A match isn't stored. Instead, in one new directory under `evidence`:
-
-- `blobs/` gets the blob, and a record of each other blob its uploader
-  owned, which their ban suspends (as `ban --preserve` would);
-- `record.json` says when, how it came (`upload`, `mirror`, `retry` or
-  `scan`), who sent it and from what address, its PDQ and what Shield
-  said;
-
-then the blob and its uploader are banned (protected keys lose the blob
-but keep their key and the rest), and `alert_command` is run with the
-record on stdin. The server answers 403. A US provider must report what it finds to
-[NCMEC](https://report.cybertip.org/) and preserve it for a year; the
-directory is what that takes.
+A match isn't stored. It's dealt with as the dashboard's **Child abuse…**
+deals with CSAM: preserved in the evidence folder (`admin.preserve`,
+`data/evidence` by default), and banned with its uploaders (protected keys
+lose the blob but keep their key and the rest), whose other blobs are
+suspended and recorded as its context. Its record there also lists its
+`detections`: when, how it came (`upload`, `mirror`, `retry` or `scan`),
+who sent it and from what address, its PDQ and what Shield said. The
+dashboard's Evidence lists it until its CyberTipline report number is
+entered, and deletes its copy a year after; `alert_command` is run with the
+match (JSON) on stdin, to tell someone. The server answers 403. A US
+provider must report what it finds to [NCMEC](https://report.cybertip.org/)
+and preserve it for a year.
 
 If Shield can't be asked, the image is kept and queued, and asked about
 again every `retry_every` seconds, so an outage doesn't stop uploads. A

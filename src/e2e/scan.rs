@@ -93,7 +93,8 @@ fn png(seed: u32) -> Vec<u8> {
 struct Setup {
     s: super::Server,
     shield: Arc<Mock>,
-    evidence: tempfile::TempDir,
+    /// The evidence folder: the data's own `evidence`.
+    evidence: std::path::PathBuf,
     alerts: std::path::PathBuf,
     _etc: tempfile::TempDir,
 }
@@ -110,16 +111,15 @@ async fn setup_scanning(extra: &str, scan: &str) -> Setup {
     let creds = etc.path().join("shield");
     std::fs::write(&creds, "user:secret\n").unwrap();
     let alerts = etc.path().join("alerts");
-    let evidence = tempfile::tempdir().unwrap();
     let s = start(&format!(
-        "{extra}\n[scan]\nenabled = true\nshield_url = {:?}\ncredentials_file = {:?}\nevidence = {:?}\n\
+        "{extra}\n[scan]\nenabled = true\nshield_url = {:?}\ncredentials_file = {:?}\n\
          alert_command = [\"sh\", \"-c\", \"cat >> {}\"]\n{scan}",
         shield.url,
         creds.to_str().unwrap(),
-        evidence.path().to_str().unwrap(),
         alerts.display(),
     ))
     .await;
+    let evidence = s.app.config.evidence();
     Setup {
         s,
         shield,
@@ -137,27 +137,21 @@ fn pk(kp: &secp256k1::Keypair) -> [u8; 32] {
     kp.x_only_public_key().0.to_byte_array()
 }
 
-/// Each incident directory under `evidence`, oldest first, with its record.
-fn incidents(evidence: &std::path::Path) -> Vec<(std::path::PathBuf, Value)> {
-    let mut dirs: Vec<_> = std::fs::read_dir(evidence)
-        .unwrap()
-        .map(|e| e.unwrap().path())
-        .collect();
-    dirs.sort_by_key(|d| (d.as_os_str().len(), d.clone()));
-    dirs.into_iter()
-        .map(|d| {
-            let record =
-                serde_json::from_slice(&std::fs::read(d.join("record.json")).unwrap()).unwrap();
-            (d, record)
-        })
-        .collect()
+/// The evidence kept of a blob: its record, and its copy if one was made.
+fn kept(evidence: &std::path::Path, h: Hash) -> (Value, Option<Vec<u8>>) {
+    let rec =
+        serde_json::from_slice(&std::fs::read(evidence.join(format!("{}.json", h.hex()))).unwrap())
+            .unwrap();
+    (rec, std::fs::read(evidence.join(h.hex())).ok())
 }
 
-/// The one incident directory under `evidence`, and its record.
-fn incident(evidence: &std::path::Path) -> (std::path::PathBuf, Value) {
-    let mut all = incidents(evidence);
-    assert_eq!(all.len(), 1, "{all:?}");
-    all.remove(0)
+/// The blobs banned as CSAM, as the dashboard's Evidence lists them.
+fn flagged(evidence: &std::path::Path) -> Vec<Value> {
+    crate::moderate::evidence(evidence)
+        .unwrap()
+        .into_iter()
+        .filter(|r| r["context_of"].as_array().is_none_or(Vec::is_empty))
+        .collect()
 }
 
 #[tokio::test]
@@ -194,19 +188,16 @@ async fn a_match_is_kept_out_preserved_and_its_uploader_banned() {
         StatusCode::NOT_FOUND
     );
 
-    // Preserved; the uploader's other blob suspended: hidden, kept in
-    // place, and recorded as its context.
-    let (dir, record) = incident(t.evidence.path());
-    assert_eq!(
-        std::fs::read(dir.join("blobs").join(Hash::of(BAD).hex())).unwrap(),
-        BAD
-    );
-    assert!(!dir.join("blobs").join(Hash::of(&earlier).hex()).exists());
-    assert!(
-        dir.join("blobs")
-            .join(format!("{}.json", Hash::of(&earlier).hex()))
-            .exists()
-    );
+    // Preserved in the evidence folder, as the dashboard keeps CSAM; the
+    // uploader's other blob suspended: hidden, kept in place, and recorded
+    // as its context.
+    let (record, copy) = kept(&t.evidence, Hash::of(BAD));
+    assert_eq!(copy.unwrap(), BAD);
+    let (context, copy) = kept(&t.evidence, Hash::of(&earlier));
+    assert!(copy.is_none());
+    assert_eq!(context["context_of"], json!([Hash::of(BAD).hex()]));
+    assert_eq!(context["suspended"], true);
+    assert_eq!(flagged(&t.evidence).len(), 1);
     assert_eq!(
         get(Hash::of(&earlier)).await.unwrap().status(),
         StatusCode::NOT_FOUND
@@ -218,20 +209,32 @@ async fn a_match_is_kept_out_preserved_and_its_uploader_banned() {
     assert!(!s.app.store.is_banned(None, Some(&pk(&other))).unwrap());
 
     // The record says who, from where, and what Shield said.
-    assert_eq!(record["blob"], Hash::of(BAD).hex());
-    assert_eq!(record["via"], "upload");
-    assert_eq!(record["uploaders"], json!([hex::encode(pk(&bad))]));
-    assert_eq!(record["banned_uploaders"], json!([hex::encode(pk(&bad))]));
-    assert_eq!(record["ip"], "127.0.0.1");
-    assert_eq!(record["shield"]["classification"], "csam");
-    assert_eq!(record["pdq"], pdq_of(BAD));
-    assert_eq!(record["removed"], json!([]));
-    assert_eq!(record["suspended"], json!([Hash::of(&earlier).hex()]));
-    assert_eq!(record["problems"], json!([]));
+    assert_eq!(record["sha256"], Hash::of(BAD).hex());
+    assert_eq!(record["size"], BAD.len());
+    assert_eq!(record["owners"], json!([hex::encode(pk(&bad))]));
+    assert!(
+        record["reason"]
+            .as_str()
+            .unwrap()
+            .starts_with("CSAM: Arachnid Shield csam (near)")
+    );
+    assert!(record["reported"].is_null());
+    let d = &record["detections"][0];
+    assert_eq!(d["by"], "Arachnid Shield");
+    assert_eq!(d["via"], "upload");
+    assert_eq!(d["uploaders"], json!([hex::encode(pk(&bad))]));
+    assert_eq!(d["ip"], "127.0.0.1");
+    assert_eq!(d["classification"], "csam");
+    assert_eq!(d["match_type"], "near");
+    assert_eq!(d["pdq"], pdq_of(BAD));
+    assert_eq!(d["problems"], json!([]));
 
-    // The alert got the record.
+    // The alert says the same, and what the ban did.
     let alert: Value = serde_json::from_slice(&std::fs::read(&t.alerts).unwrap()).unwrap();
     assert_eq!(alert["blob"], Hash::of(BAD).hex());
+    assert_eq!(alert["banned_uploaders"], json!([hex::encode(pk(&bad))]));
+    assert_eq!(alert["suspended"], json!([Hash::of(&earlier).hex()]));
+    assert_eq!(alert["detection"]["ip"], "127.0.0.1");
 
     // Banned: the key, and the blob for anyone.
     assert!(s.app.store.is_banned(None, Some(&pk(&bad))).unwrap());
@@ -240,17 +243,23 @@ async fn a_match_is_kept_out_preserved_and_its_uploader_banned() {
         StatusCode::FORBIDDEN
     );
 
-    // Another key sending the same image is a match of its own: its own
-    // record, beside the first, and banned too.
+    // Another key sending the same image is a match of its own: noted on
+    // the same record, beside the first, and banned too.
     assert_eq!(
         upload(&other, BAD).await.unwrap().status(),
         StatusCode::FORBIDDEN
     );
-    let all = incidents(t.evidence.path());
-    assert_eq!(all.len(), 2);
-    assert_eq!(all[0].1["uploaders"], json!([hex::encode(pk(&bad))]));
-    assert_eq!(all[1].1["uploaders"], json!([hex::encode(pk(&other))]));
-    assert_eq!(all[1].1["suspended"], json!([Hash::of(b"just text").hex()]));
+    let (record, _) = kept(&t.evidence, Hash::of(BAD));
+    assert_eq!(
+        record["owners"],
+        json!([hex::encode(pk(&bad)), hex::encode(pk(&other))])
+    );
+    let ds = record["detections"].as_array().unwrap();
+    assert_eq!(ds.len(), 2);
+    assert_eq!(ds[1]["uploaders"], json!([hex::encode(pk(&other))]));
+    assert_eq!(flagged(&t.evidence).len(), 1);
+    let (context, _) = kept(&t.evidence, Hash::of(b"just text"));
+    assert_eq!(context["suspended"], true);
     assert!(s.app.store.is_banned(None, Some(&pk(&other))).unwrap());
 
     // Everyone else is unaffected.
@@ -297,12 +306,13 @@ async fn an_outage_keeps_uploads_and_asks_again() {
         .await
         .unwrap();
     assert_eq!(r.status(), StatusCode::NOT_FOUND);
-    let (dir, record) = incident(t.evidence.path());
-    assert_eq!(record["via"], "retry");
-    assert_eq!(record["uploaders"], json!([hex::encode(pk(&kp))]));
+    let (record, copy) = kept(&t.evidence, Hash::of(BAD));
+    assert_eq!(copy.unwrap(), BAD);
+    assert_eq!(record["owners"], json!([hex::encode(pk(&kp))]));
+    assert_eq!(record["detections"][0]["via"], "retry");
     assert_eq!(
-        std::fs::read(dir.join("blobs").join(Hash::of(BAD).hex())).unwrap(),
-        BAD
+        record["detections"][0]["uploaders"],
+        json!([hex::encode(pk(&kp))])
     );
     assert!(
         s.app
@@ -352,8 +362,9 @@ async fn exempt_keys_lose_the_blob_but_not_the_key() {
         .await
         .unwrap();
     assert_eq!(r.status(), StatusCode::FORBIDDEN);
-    let (_, record) = incident(t.evidence.path());
-    assert_eq!(record["banned_uploaders"], json!([]));
+    let alert: Value = serde_json::from_slice(&std::fs::read(&t.alerts).unwrap()).unwrap();
+    assert_eq!(alert["banned_uploaders"], json!([]));
+    assert_eq!(kept(&t.evidence, Hash::of(BAD)).1.unwrap(), BAD);
     let bans = s.app.store.bans().unwrap();
     assert_eq!(bans.len(), 1);
     assert_eq!(bans[0].target, Banned::Blob(Hash::of(BAD)));
@@ -388,8 +399,7 @@ async fn shield_is_asked_before_explicit_media_is_refused() {
         upload(&matched).await.unwrap().status(),
         StatusCode::FORBIDDEN
     );
-    let (dir, _) = incident(t.evidence.path());
-    assert!(dir.join("blobs").join(Hash::of(&matched).hex()).exists());
+    assert!(kept(&t.evidence, Hash::of(&matched)).1.is_some());
     let ban = s
         .app
         .store
@@ -399,7 +409,7 @@ async fn shield_is_asked_before_explicit_media_is_refused() {
         .unwrap();
     assert!(ban.reason.starts_with("CSAM"), "{}", ban.reason);
 
-    // Explicit only: refused by its score, with no incident. (The uploader
+    // Explicit only: refused by its score, kept as no evidence. (The uploader
     // is banned by now, so another key sends it.)
     let other = keypair();
     let r = c
@@ -410,7 +420,7 @@ async fn shield_is_asked_before_explicit_media_is_refused() {
         .await
         .unwrap();
     assert_eq!(r.status(), StatusCode::FORBIDDEN);
-    assert_eq!(incidents(t.evidence.path()).len(), 1);
+    assert_eq!(flagged(&t.evidence).len(), 1);
     let ban = s
         .app
         .store

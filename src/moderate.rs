@@ -210,14 +210,7 @@ fn ban_txn_with(
         }
     }
     if let Some(dir) = preserve {
-        std::fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(dir)
-            .and_then(|()| {
-                std::fs::set_permissions(dir, std::os::unix::fs::PermissionsExt::from_mode(0o700))
-            })
-            .with_context(|| format!("Could not make {} private", dir.display()))?;
+        private_dir(dir)?;
     }
     // The blobs named, as against the rest of an uploader's, kept as context.
     let flagged: Vec<Hash> = targets
@@ -426,6 +419,84 @@ pub fn follow(
         out.removed.push(rec);
     }
     Ok(out)
+}
+
+/// Make `dir`, if need be, readable by its owner alone: what's kept there
+/// may be evidence.
+pub fn private_dir(dir: &Path) -> Result<()> {
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)
+        .and_then(|()| {
+            std::fs::set_permissions(dir, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+        })
+        .with_context(|| format!("Could not make {} private", dir.display()))
+}
+
+/// The record of a blob kept in `dir` that was never stored, as a match on
+/// arrival is: what `record` writes of a stored one. If there's one already,
+/// from an earlier match, it's kept, and these owners added to it.
+pub fn record_unstored(
+    dir: &Path,
+    hash: &Hash,
+    size: u64,
+    mime: Option<&str>,
+    owners: &[[u8; 32]],
+    at: u64,
+    reason: &str,
+) -> Result<()> {
+    if dir.join(format!("{}.json", hash.hex())).exists() {
+        return add_detection(dir, hash, owners, None);
+    }
+    let rec = Record {
+        hash: *hash,
+        size,
+        uploaded: at,
+        mime: mime.map(String::from),
+        flags: 0,
+        br_size: 0,
+    };
+    record(dir, &rec, owners, &[], at, reason, &[], false)?;
+    std::fs::File::open(dir)?.sync_all()?;
+    Ok(())
+}
+
+/// Note on the record of `hash` kept in `dir` who else sent it, and with
+/// `detection`, what found it this time (its `detections`, oldest first: a
+/// scan match's when, how, from whom and where, and what Shield said).
+pub fn add_detection(
+    dir: &Path,
+    hash: &Hash,
+    owners: &[[u8; 32]],
+    detection: Option<serde_json::Value>,
+) -> Result<()> {
+    let path = dir.join(format!("{}.json", hash.hex()));
+    let mut rec: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(&path).with_context(|| format!("Could not read {}", path.display()))?,
+    )?;
+    let obj = rec
+        .as_object_mut()
+        .context("A record that isn't an object")?;
+    let known = obj
+        .entry("owners")
+        .or_insert_with(|| serde_json::json!([]))
+        .as_array_mut()
+        .context("A record's owners aren't a list")?;
+    for pk in owners {
+        let hex = serde_json::Value::from(hex::encode(pk));
+        if !known.contains(&hex) {
+            known.push(hex);
+        }
+    }
+    if let Some(d) = detection {
+        obj.entry("detections")
+            .or_insert_with(|| serde_json::json!([]))
+            .as_array_mut()
+            .context("A record's detections aren't a list")?
+            .push(d);
+    }
+    write_record(&path, &rec)
 }
 
 /// Copy a blob's bytes to `dir/<sha256>`, only its owner able to read it,

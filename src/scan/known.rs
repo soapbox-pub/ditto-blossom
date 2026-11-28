@@ -1,12 +1,12 @@
 //! Keeping known CSAM out, with Arachnid Shield.
 //!
 //! Each new image is hashed with PDQ here, and only the hash goes to
-//! Shield. A match isn't stored: it's preserved in its own directory under
-//! `scan.evidence`, with a record of who sent it, from where and what
-//! Shield said, and banned, with its uploader (unless protected), whose other
-//! blobs are suspended: hidden, and kept, so lifting the ban undoes it. Then
-//! `scan.alert_command` is run, to tell someone, who has a report to make to
-//! NCMEC.
+//! Shield. A match isn't stored: it's banned as the dashboard bans CSAM,
+//! preserved in the evidence folder (`admin.preserve`) with a record of who
+//! sent it, from where and what Shield said, and its uploader (unless
+//! protected) banned, whose other blobs are suspended: hidden, and kept, so
+//! lifting the ban undoes it. The dashboard's Evidence lists it until its
+//! NCMEC report is noted. Then `scan.alert_command` is run, to tell someone.
 //!
 //! If Shield can't be asked, the blob is kept and queued, and asked about
 //! again every `scan.retry_every` seconds: an outage doesn't stop uploads.
@@ -174,9 +174,11 @@ impl Scanner {
             .context("scan needs credentials_file")?;
         let creds = std::fs::read_to_string(creds_path)
             .with_context(|| format!("Could not read {}", creds_path.display()))?;
-        let evidence = scan.evidence.clone().context("scan needs evidence")?;
-        std::fs::create_dir_all(&evidence)
-            .with_context(|| format!("Could not create {}", evidence.display()))?;
+        if let Some(old) = &scan.evidence {
+            crate::warn!("scan_evidence_unused", "dir": old.display().to_string(),
+                "note": "matches are kept in admin.preserve now, with the dashboard's");
+        }
+        let evidence = config.evidence();
         Ok(Some(Scanner {
             shield: Shield::new(&scan.shield_url, &creds)?,
             evidence,
@@ -214,9 +216,14 @@ impl Scanner {
         }
     }
 
-    /// Deal with a match: preserve it and whatever its owners' ban takes
-    /// out, ban, write its record, alert. `source` is its bytes if it
-    /// wasn't kept (a match on arrival); otherwise the ban preserves it.
+    /// Deal with a match as the dashboard's **Child abuse…** does (see
+    /// `moderate::ban_csam`): the blob is preserved in the evidence folder
+    /// (`admin.preserve`) and banned, with its uploaders but protected keys,
+    /// whose other blobs are suspended and recorded as its context. Its
+    /// record there gains what Shield said, how it came and from what
+    /// address, so the dashboard's Evidence lists it for the NCMEC report.
+    /// Then the alert. `source` is its bytes if it wasn't kept (a match on
+    /// arrival); otherwise the ban preserves it. Where its copy is.
     pub async fn on_match(
         &self,
         m: Match<'_>,
@@ -224,16 +231,8 @@ impl Scanner {
         banner: Banner<'_>,
     ) -> Result<PathBuf> {
         let at = now();
-        let dir = self.incident_dir(at, &m.hash)?;
-        let blobs = dir.join("blobs");
-        std::fs::create_dir(&blobs)
-            .with_context(|| format!("Could not create {}", blobs.display()))?;
+        let dir = self.evidence.clone();
         let mut problems = Vec::new();
-        if let Some(src) = source
-            && let Err(e) = src.copy_to(&blobs, &m.hash)
-        {
-            problems.push(format!("preserving the blob: {e:#}"));
-        }
         let banned_owners: Vec<[u8; 32]> = m
             .owners
             .iter()
@@ -241,26 +240,37 @@ impl Scanner {
             .copied()
             .collect();
         let reason = format!(
-            "CSAM: Arachnid Shield {} ({}) match on {}, {}",
+            "CSAM: Arachnid Shield {} ({}) match on {}",
             m.verdict.classification,
             m.verdict.match_type.as_deref().unwrap_or("?"),
             m.via,
-            stamp(at)
         );
+        // Not stored, so no ban will copy it: kept here first.
+        if let Some(src) = source {
+            let kept = crate::moderate::private_dir(&dir).and_then(|()| {
+                src.copy_to(&dir, &m.hash)?;
+                crate::moderate::record_unstored(
+                    &dir, &m.hash, m.size, m.mime, &m.owners, at, &reason,
+                )
+            });
+            if let Err(e) = kept {
+                problems.push(format!("preserving the blob: {e:#}"));
+            }
+        }
         let mut targets = vec![Banned::Blob(m.hash)];
         targets.extend(banned_owners.iter().map(|pk| Banned::Pubkey(*pk)));
         let job = |targets: Vec<Banned>| BanJob {
             targets,
             reason: reason.clone(),
-            preserve: Some(blobs.clone()),
+            preserve: Some(dir.clone()),
             protected: self.protected.clone(),
         };
         let (removed, suspended) = match banner.ban(job(targets)).await {
             Ok(r) => r,
             Err(e) => {
-                // At least keep the blob itself out; its owners' other
-                // blobs wait for a person, as they couldn't be preserved.
-                problems.push(format!("banning its owners: {e:#}"));
+                // At least keep the blob itself out; its owners wait for a
+                // person.
+                problems.push(format!("banning its uploaders: {e:#}"));
                 banner
                     .ban(job(vec![Banned::Blob(m.hash)]))
                     .await
@@ -270,10 +280,26 @@ impl Scanner {
                     })
             }
         };
-        let record = json!({
-            "detected_at": at,
-            "detected_at_utc": iso(at),
+        let mut detection = json!({
+            "by": "Arachnid Shield",
             "via": m.via,
+            "at": at,
+            "uploaders": m.owners.iter().map(hex::encode).collect::<Vec<_>>(),
+            "ip": m.ip.map(|ip| ip.to_string()),
+            "classification": m.verdict.classification,
+            "match_type": m.verdict.match_type,
+            "near_match_details": m.verdict.near_match_details,
+            "pdq": m.pdq.base64(),
+            "pdq_quality": m.pdq.quality,
+            "problems": problems,
+        });
+        if let Err(e) =
+            crate::moderate::add_detection(&dir, &m.hash, &m.owners, Some(detection.clone()))
+        {
+            problems.push(format!("recording what Shield said: {e:#}"));
+            detection["problems"] = json!(problems);
+        }
+        let alert = json!({
             "blob": m.hash.hex(),
             "size": m.size,
             "type": m.mime,
@@ -281,44 +307,15 @@ impl Scanner {
             "uploaders": m.owners.iter().map(hex::encode).collect::<Vec<_>>(),
             "banned_uploaders": banned_owners.iter().map(hex::encode).collect::<Vec<_>>(),
             "ip": m.ip.map(|ip| ip.to_string()),
-            "pdq": m.pdq.base64(),
-            "pdq_quality": m.pdq.quality,
-            "shield": {
-                "classification": m.verdict.classification,
-                "match_type": m.verdict.match_type,
-                "near_match_details": m.verdict.near_match_details,
-            },
+            "detection": detection,
             "removed": removed.iter().map(Hash::hex).collect::<Vec<_>>(),
             "suspended": suspended.iter().map(Hash::hex).collect::<Vec<_>>(),
-            "evidence": dir.display().to_string(),
+            "evidence": dir.join(m.hash.hex()).display().to_string(),
             "problems": problems,
         });
-        let text = serde_json::to_vec_pretty(&record)?;
-        std::fs::write(dir.join("record.json"), &text)
-            .with_context(|| format!("Could not write {}", dir.join("record.json").display()))?;
-        crate::error!("scan_match", "blob": m.hash.hex(), "via": m.via, "classification": m.verdict.classification, "uploaders": record["uploaders"], "ip": record["ip"], "removed": removed.len(), "suspended": suspended.len(), "evidence": dir.display().to_string(), "problems": record["problems"]);
-        self.alert(text).await;
-        Ok(dir)
-    }
-
-    /// A new directory for a match: never one an earlier match has, even
-    /// the same blob's in the same second.
-    fn incident_dir(&self, at: u64, hash: &Hash) -> Result<PathBuf> {
-        let base = format!("{}-{}", stamp(at), &hash.hex()[..12]);
-        for n in 1.. {
-            let dir = match n {
-                1 => self.evidence.join(&base),
-                n => self.evidence.join(format!("{base}-{n}")),
-            };
-            match std::fs::create_dir(&dir) {
-                Ok(()) => return Ok(dir),
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                Err(e) => {
-                    return Err(e).with_context(|| format!("Could not create {}", dir.display()));
-                }
-            }
-        }
-        unreachable!()
+        crate::error!("scan_match", "blob": m.hash.hex(), "via": m.via, "classification": m.verdict.classification, "uploaders": alert["uploaders"], "ip": alert["ip"], "suspended": suspended.len(), "evidence": alert["evidence"], "problems": alert["problems"]);
+        self.alert(serde_json::to_vec_pretty(&alert)?).await;
+        Ok(dir.join(m.hash.hex()))
     }
 
     async fn alert(&self, record: Vec<u8>) {
@@ -526,43 +523,4 @@ pub fn scan_existing(config: &Config, from: u64, limit: Option<u64>, dry_run: bo
     matched += flush(&mut batch)?;
     crate::info!("scan_done", "seq": last, "seen": seen, "hashed": hashed, "matched": matched);
     Ok(())
-}
-
-/// `20261127-143807`, UTC: sorts, and is safe in a file name.
-fn stamp(secs: u64) -> String {
-    let (y, mo, d, h, mi, s) = civil(secs);
-    format!("{y:04}{mo:02}{d:02}-{h:02}{mi:02}{s:02}")
-}
-
-fn iso(secs: u64) -> String {
-    let (y, mo, d, h, mi, s) = civil(secs);
-    format!("{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{s:02}Z")
-}
-
-/// Unix seconds as a UTC date and time (Howard Hinnant's days-to-civil).
-fn civil(secs: u64) -> (i64, u32, u32, u64, u64, u64) {
-    let days = (secs / 86_400) as i64;
-    let rem = secs % 86_400;
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z.rem_euclid(146_097);
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
-    let y = yoe + era * 400 + i64::from(m <= 2);
-    (y, m, d, rem / 3600, rem % 3600 / 60, rem % 60)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn stamps_in_utc() {
-        assert_eq!(stamp(1_795_790_667), "20261127-144427");
-        assert_eq!(iso(0), "1970-01-01T00:00:00Z");
-        assert_eq!(iso(951_782_400), "2000-02-29T00:00:00Z");
-    }
 }

@@ -748,8 +748,17 @@ async function loadEvidence() {
   out.replaceChildren(...items.map(evidenceCard));
 }
 
+// How a match was found, a line: "Arachnid Shield: csam, near match, on
+// upload from 1.2.3.4, 2026-11-28 07:18".
+function detectionLine(d) {
+  const what = [d.classification, d.match_type && `${d.match_type} match`].filter(Boolean).join(", ");
+  const how = [d.via && `on ${d.via}`, d.ip && `from ${d.ip}`].filter(Boolean).join(" ");
+  return `${d.by || "Scan"}: ${what}${how ? `, ${how}` : ""}, ${when(d.at)}`;
+}
+
 function evidenceCard(e) {
   const reports = Array.isArray(e.reports) ? e.reports : [];
+  const detections = Array.isArray(e.detections) ? e.detections : [];
   const details = [
     `SHA-256: ${e.sha256}`,
     `File: ${e.type || "unknown type"}, ${e.size} bytes`,
@@ -757,6 +766,8 @@ function evidenceCard(e) {
     `Uploaded by (Nostr pubkeys): ${e.owners.join(", ") || "unknown"}`,
     `Removed from public access: ${when(e.banned)}`,
     `User reports: ${reports.length}`,
+    ...detections.map((d) => `Found by ${detectionLine(d)}`),
+    ...detections.filter((d) => d.pdq).map((d) => `PDQ hash: ${d.pdq}`).slice(0, 1),
     ...(e.context ? [`Other files from the uploader kept: ${e.context}`] : []),
   ].join("\n");
   const pre = el("pre", { class: "details", hidden: true }, details);
@@ -789,6 +800,10 @@ function evidenceCard(e) {
         ? el("ul", { class: "people" }, e.owners.map((o) => el("li", {}, person(o), el("div", { class: "mono small dim" }, o))))
         : "unknown"),
       el("dt", {}, "User reports"), el("dd", {}, reports.length ? plural(reports.length, "report") : "none"),
+      detections.length > 0 && [
+        el("dt", {}, "Found by"),
+        el("dd", {}, el("ul", {}, detections.map((d) => el("li", {}, detectionLine(d))))),
+      ],
       el("dt", {}, "Also kept"), el("dd", {}, e.context ? `${plural(e.context, "other file")} from the uploader` : "nothing else"),
       el("dt", {}, "On the server"), el("dd", { class: "mono" }, e.path),
       e.reported && [

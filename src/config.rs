@@ -263,8 +263,8 @@ pub struct Scan {
     /// server and no one else.
     #[serde(default)]
     pub credentials_file: Option<PathBuf>,
-    /// Where a match's blobs and its record are kept, a directory each:
-    /// what US law has a provider preserve for its NCMEC report.
+    /// No longer used: matches are kept in `admin.preserve`, with the
+    /// dashboard's (see `Config::evidence`). Still read, so old configs load.
     #[serde(default)]
     pub evidence: Option<PathBuf>,
     /// Run on each match, with its record (JSON) on stdin: to tell someone.
@@ -422,13 +422,8 @@ impl Config {
         config.public_url = config.public_url.trim_end_matches('/').to_string();
         config.domain()?;
         let scan = &config.scan;
-        if scan.enabled {
-            if !scan.shield() && !scan.refuses() {
-                bail!("scan needs credentials_file, for Shield, or model, or both");
-            }
-            if scan.shield() && scan.evidence.is_none() {
-                bail!("scan needs evidence, a directory to keep matches in");
-            }
+        if scan.enabled && !scan.shield() && !scan.refuses() {
+            bail!("scan needs credentials_file, for Shield, or model, or both");
         }
         if config
             .scan
@@ -527,11 +522,7 @@ mod tests {
             ))
         };
         assert!(scan("").is_err());
-        assert!(
-            scan("credentials_file = \"/c\"\n").is_err(),
-            "needs evidence"
-        );
-        let c = scan("credentials_file = \"/c\"\nevidence = \"/e\"\n").unwrap();
+        let c = scan("credentials_file = \"/c\"\n").unwrap();
         assert!(c.scan.shield() && !c.scan.refuses());
         let c = scan("model = \"/m\"\nhead = \"/h\"\n").unwrap();
         assert!(!c.scan.shield() && c.scan.refuses());
