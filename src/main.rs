@@ -20,6 +20,7 @@ mod mime;
 mod mirror;
 mod moderate;
 mod pdq;
+mod restore;
 mod routes;
 mod scan;
 mod send_file;
@@ -46,6 +47,7 @@ usage:
   ditto-blossom ban [-c CONFIG] [--reason TEXT] [--preserve DIR] [--pubkey HEX]... [SHA256]...
   ditto-blossom unban [-c CONFIG] [--pubkey HEX]... [SHA256]...
   ditto-blossom bans [-c CONFIG]
+  ditto-blossom restore [-c CONFIG] [--owner HEX]... [--except SHA256]... [--verify] DIR
   ditto-blossom scan [-c CONFIG] [--from SEQ] [--limit N] [--dry-run]
   ditto-blossom scan [-c CONFIG | --model ENCODER --head HEAD] [--threshold T] [--ffmpeg PATH] [--jobs N] [--refused] PATH...
   ditto-blossom train [-c CONFIG | --model ENCODER] --labels LABELS --out HEAD [--blobs DIR]... [--catch 0.99] [--c 3] [--jobs N] [--scores FILE] [--cache FILE]
@@ -61,6 +63,10 @@ ban does that and keeps them out: banned blobs aren't stored again, by
 anyone, and banned pubkeys can't upload or mirror. A pubkey's ban takes out
 and bans every blob it owns; --preserve copies each blob it removes to DIR
 first. unban lifts bans; bans lists them.
+restore puts back what a ban took out by mistake, from the copies --preserve
+(or a scan match) kept in DIR: each is unbanned, linked back into place and
+given back to the owners its <sha256>.json names, or --owner. --except names
+blobs to leave banned and preserved.
 scan, given no files, asks Arachnid Shield about every image already here,
 and deals with each match as an upload's: preserved, banned with its
 uploaders, recorded and alerted. --from carries on from the seq a stopped
@@ -88,7 +94,8 @@ fn run() -> Result<()> {
     let mut args = std::env::args().skip(1).peekable();
     let command = match args.peek().map(String::as_str) {
         Some(
-            "serve" | "import" | "remove" | "ban" | "unban" | "bans" | "scan" | "train" | "pdq",
+            "serve" | "import" | "remove" | "ban" | "unban" | "bans" | "scan" | "train" | "pdq"
+            | "restore",
         ) => args.next().expect("peeked"),
         Some("--version" | "-V") => {
             println!("ditto-blossom {}", env!("CARGO_PKG_VERSION"));
@@ -115,6 +122,7 @@ fn run() -> Result<()> {
     let mut cache = None;
     let (mut catch, mut c) = (0.99f64, 3.0f64);
     let mut config_given = false;
+    let (mut restore_owners, mut restore_except) = (Vec::new(), Vec::new());
     while let Some(arg) = args.next() {
         let mut value = || args.next().with_context(|| format!("{arg} needs a value"));
         let mut number = |what: &str| -> Result<f64> {
@@ -156,6 +164,25 @@ fn run() -> Result<()> {
                 limit = Some(value()?.parse().context("--limit takes a number")?)
             }
             "--dry-run" if command == "scan" => dry_run = true,
+            "--verify" if command == "restore" => verify = true,
+            "--owner" | "--except" if command == "restore" => {
+                let v = value()?;
+                match arg.as_str() {
+                    "--owner" => restore_owners.push(
+                        hex::decode(&v)
+                            .ok()
+                            .and_then(|b| <[u8; 32]>::try_from(b).ok())
+                            .with_context(|| format!("{v} isn't a hex pubkey"))?,
+                    ),
+                    _ => restore_except.push(
+                        hash::Hash::parse(v.as_bytes())
+                            .with_context(|| format!("{v} isn't a SHA-256 hash"))?,
+                    ),
+                }
+            }
+            path if command == "restore" && !path.starts_with('-') => {
+                dir = Some(PathBuf::from(path))
+            }
             "--pubkey" if targeted => {
                 let hex = value()?;
                 pubkeys.push(
@@ -241,6 +268,14 @@ fn run() -> Result<()> {
         "ban" => moderate::ban(&config, &targets, &reason, preserve.as_deref()),
         "unban" => moderate::unban(&config, &targets),
         "bans" => moderate::list(&config),
+        "restore" => restore::run(
+            &config,
+            &dir.context("restore needs the directory the copies are in")?,
+            &restore_owners,
+            &restore_except,
+            verify,
+        )
+        .map(|_| ()),
         "scan" => {
             install_crypto();
             scan::known::scan_existing(&config, from, limit, dry_run)
